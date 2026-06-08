@@ -15,7 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
 
         let args = CommandLine.arguments
-        if args.contains("--demo") || args.contains("--demo-dwell") || args.contains("--demo-layers") {
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo"]
+        if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
         } else {
@@ -151,6 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runLayersDemo(snapshotDir: snapshotDir)
             return
         }
+        if args.contains("--demo-undo") {
+            runUndoDemo(snapshotDir: snapshotDir)
+            return
+        }
 
         if args.contains("--demo") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -257,8 +262,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// undo 検証: ストロークを描いて乾かす → before 撮影 → undo → after 撮影(空に戻る)
+    private func runUndoDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            engine.brush = .watercolor
+            engine.beginStroke()
+            for i in 0..<90 {
+                let t = Float(i) / 89
+                engine.addStrokeSample(
+                    at: SIMD2(0.12 * w + 0.76 * w * t, 0.5 * h + 0.15 * h * sin(t * .pi * 2.4)),
+                    pressure: 0.2 + 0.7 * sin(t * .pi))
+            }
+            engine.endStroke()
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+            try? engine.savePNG(to: dir.appendingPathComponent("undo-before.png")) // 描画あり
+            engine.undo()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) {
+            try? engine.savePNG(to: dir.appendingPathComponent("undo-after.png")) // 空に戻る
+            NSApp.terminate(nil)
+        }
+    }
+
     private func buildMenu() {
         let mainMenu = NSMenu()
+
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
@@ -266,6 +300,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(
             withTitle: "Quit Bloom", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"
         )
+
+        // 編集メニュー(取り消す / やり直す)
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "編集")
+        editItem.submenu = editMenu
+        let undoItem = NSMenuItem(title: "取り消す", action: #selector(undoAction), keyEquivalent: "z")
+        undoItem.target = self
+        let redoItem = NSMenuItem(title: "やり直す", action: #selector(redoAction), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        redoItem.target = self
+        editMenu.addItem(undoItem)
+        editMenu.addItem(redoItem)
+
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func undoAction() { canvas?.undo() }
+    @objc private func redoAction() { canvas?.redo() }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(undoAction): return canvas?.canUndo ?? false
+        case #selector(redoAction): return canvas?.canRedo ?? false
+        default: return true
+        }
     }
 }

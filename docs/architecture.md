@@ -22,6 +22,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - `CanvasView` と `InspectorView` はクロージャで疎結合: `canvas.onStatus`/`onBrushChanged`/`onLayersChanged` ↔ `inspector.onSelectBrush`/`onSizeChange`/`onWaterChange`/`onColorChange`/`onClear`/`onAddLayer`/`onDeleteLayer`/`onSelectLayer`/`onToggleLayer`。キー操作(`1`/`2`/`[`/`]`)とスライダは双方向に同期する
 - インスペクタの中身: ブラシ切替・カラーウェル(任意色)・サイズ/水量スライダ・**レイヤーリスト(NSTableView)**(目アイコンで表示切替、選択でアクティブ化、**行の D&D で並べ替え** → `moveLayer`、＋/🗑 で追加削除)・選択層の不透明スライダ・クリア
 - レイヤーリストは `reflectLayers` でエンジン状態を反映。プログラム選択時の `selectionDidChange` ループは `isReflecting` フラグで抑止
+- **編集メニュー**: 取り消す(Cmd+Z)/ やり直す(Cmd+Shift+Z)。`validateMenuItem` で `canUndo`/`canRedo` に応じて有効化
 - **検証モード**(`--demo` / `--demo-dwell`)はキャンバス全面の素のウィンドウにして、スナップショットにインスペクタが写り込まないようにする
 - エンジンのグリッドは生成時のキャンバスサイズで固定(ウィンドウは非リサイズ)
 
@@ -71,6 +72,16 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - 畳み込みは `compositeLayerKernel` を下→上に逐次 dispatch(同一バッファへ書くので `memoryBarrier` で順序保証)。レイヤー操作時のみ再構築(低頻度)
 - 操作 API: `addLayer` / `deleteLayer(row:)` / `setActiveLayer(row:)` / `toggleLayerVisible(row:)` / `setLayerOpacity(row:opacity:)` / `moveLayer(fromRow:toRow:)`。UI の行は上が手前(`layerInfos` は内部配列の逆順)。`moveLayer` はアクティブ層を deposit バッファの同一性で追従させる
 
+### Undo / Redo(スナップショット方式)
+
+流体シミュレーションは連続的でコマンド再生が難しいため、**スナップショット方式**を採る。
+
+- 取り消し可能な操作の**直前**に `checkpoint()` で全レイヤーの `D`(乾いた絵)+ メタデータ(visible/opacity/name/active/counter)を `Data` にコピーして undo スタックへ積む
+- 取り消し単位: ストローク(`beginStroke`)・`clear`・`addLayer`・`deleteLayer`・`moveLayer`。選択/不透明度/表示切替は履歴に積まない(非破壊で手動で戻せるため)
+- `undo()` は現在状態を redo スタックへ積んでから undo スタックの先頭を復元。`redo()` はその逆
+- **復元時にウェット(`W`/`P`/pending)は破棄**する(取り消し中の中途半端な濡れを残さない)。これにより redo の「乾き途中ストローク」の曖昧さも回避
+- 深さは `maxUndoDepth = 30` で頭打ち。スナップショットは全レイヤー deposit のコピーなので、メモリは概ね `深さ × レイヤー数 × (グリッド × 16B)`。将来、変更レイヤーだけの差分スナップショットで削減可能
+
 ### チューニングパラメータ(SimulationEngine.SimParams)
 
 | パラメータ | 現在値 | 効果 |
@@ -108,6 +119,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - **Makefile**: `make run / test / demo`。DerivedData はリポジトリ外(`~/Library/Developer/Xcode/DerivedData/Bloom-cli`)— Dropbox 同期ノイズ回避
 - **検証**: `make demo` がデモストロークを自動実行し、wet(直後)/ dry(乾燥後)の PNG を `/tmp/bloom-snap` に出力。描き味チューニングはこのループで回す
   - ドウェル(置きっぱなし)の確認は `BloomApp --demo-dwell --snapshot-dir <dir>` → `pooled.png`(溜まり)/ `dried.png`(乾いた輪っか)
+  - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`(`undo-before.png` / `undo-after.png`)
 
 ### ハマりどころ(再発時のために)
 
