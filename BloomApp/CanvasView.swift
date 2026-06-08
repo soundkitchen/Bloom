@@ -27,6 +27,12 @@ final class CanvasView: MTKView {
     func moveLayer(from: Int, to: Int) { engine?.moveLayer(fromRow: from, toRow: to); onLayersChanged?() }
     func setLayerOpacity(row: Int, opacity: Float) { engine?.setLayerOpacity(row: row, opacity: opacity) }
 
+    // Undo / Redo（レイヤー数が変わりうるのでインスペクタも更新）
+    var canUndo: Bool { engine?.canUndo ?? false }
+    var canRedo: Bool { engine?.canRedo ?? false }
+    func undo() { engine?.undo(); onLayersChanged?() }
+    func redo() { engine?.redo(); onLayersChanged?() }
+
     override init(frame: CGRect, device: MTLDevice?) {
         super.init(frame: frame, device: device)
         do {

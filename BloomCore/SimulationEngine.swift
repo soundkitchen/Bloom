@@ -184,8 +184,8 @@ public final class SimulationEngine {
                         opacity: 1.0, name: "レイヤー 1")]
         activeLayerIndex = 0
 
-        clear()              // ウェット + アクティブ層 deposit を 0 に
-        rebuildComposites()  // below/above を 0 に(初期は他層なし)
+        zeroWetAndActiveDeposit() // ウェット + アクティブ層 deposit を 0 に(init は履歴に積まない)
+        rebuildComposites()       // below/above を 0 に(初期は他層なし)
         generatePaperTexture()
     }
 
@@ -203,6 +203,7 @@ public final class SimulationEngine {
     // MARK: - 公開 API(コアへの「コマンド」。将来 MCP からも同じ口を叩く)
 
     public func beginStroke() {
+        checkpoint() // ストロークを 1 つの取り消し単位にする
         lastStrokeSample = nil
         activeDab = nil
     }
@@ -256,12 +257,17 @@ public final class SimulationEngine {
 
     private var activeDeposit: MTLBuffer { layers[activeLayerIndex].deposit }
 
-    /// アクティブ層と乾き途中のウェットをクリア(他の層は残す)
-    public func clear() {
+    private func zeroWetAndActiveDeposit() {
         pendingStamps.removeAll()
         for buf in [waterA, waterB, pigmentA, pigmentB, activeDeposit] {
             memset(buf.contents(), 0, buf.length)
         }
+    }
+
+    /// アクティブ層と乾き途中のウェットをクリア(他の層は残す)。取り消し可能。
+    public func clear() {
+        checkpoint()
+        zeroWetAndActiveDeposit()
     }
 
     // MARK: - レイヤー操作(コアへのコマンド。将来 MCP からも叩く)
@@ -278,6 +284,7 @@ public final class SimulationEngine {
 
     public func addLayer() {
         guard let buf = makeDepositBuffer() else { return }
+        checkpoint()
         layerCounter += 1
         // アクティブ層の 1 つ上(手前)に挿入してそこをアクティブに
         layers.insert(Layer(deposit: buf, visible: true, opacity: 1.0,
@@ -292,6 +299,7 @@ public final class SimulationEngine {
         guard layers.count > 1 else { return }
         let index = layers.count - 1 - row
         guard layers.indices.contains(index) else { return }
+        checkpoint()
         layers.remove(at: index)
         if index < activeLayerIndex {
             activeLayerIndex -= 1                                   // 下の層が詰めた
@@ -328,6 +336,7 @@ public final class SimulationEngine {
     public func moveLayer(fromRow: Int, toRow: Int) {
         var rows = Array(layers.reversed()) // rows[0] = 手前
         guard rows.indices.contains(fromRow) else { return }
+        checkpoint()
         let activeBuf = layers[activeLayerIndex].deposit // 同一性でアクティブを追従
         let moved = rows.remove(at: fromRow)
         var dest = toRow
@@ -338,6 +347,77 @@ public final class SimulationEngine {
         activeLayerIndex = layers.firstIndex { $0.deposit === activeBuf } ?? activeLayerIndex
         endStroke()
         rebuildComposites()
+    }
+
+    // MARK: - Undo / Redo(スナップショット方式)
+    //
+    // 流体シミュレーションは連続的でコマンド再生が難しいため、取り消し可能な操作の
+    // 直前に全レイヤーの deposit(乾いた絵)+ メタデータをコピーして保存する。
+    // ウェット(W/P)は復元時に破棄する(取り消し中の中途半端な濡れを残さない)。
+
+    private struct LayerState {
+        let deposit: Data
+        let visible: Bool
+        let opacity: Float
+        let name: String
+    }
+    private struct DocSnapshot {
+        let layers: [LayerState]
+        let activeLayerIndex: Int
+        let layerCounter: Int
+    }
+    private var undoStack: [DocSnapshot] = []
+    private var redoStack: [DocSnapshot] = []
+    private let maxUndoDepth = 30
+
+    public var canUndo: Bool { !undoStack.isEmpty }
+    public var canRedo: Bool { !redoStack.isEmpty }
+
+    private func makeSnapshot() -> DocSnapshot {
+        let states = layers.map {
+            LayerState(deposit: Data(bytes: $0.deposit.contents(), count: $0.deposit.length),
+                       visible: $0.visible, opacity: $0.opacity, name: $0.name)
+        }
+        return DocSnapshot(layers: states, activeLayerIndex: activeLayerIndex, layerCounter: layerCounter)
+    }
+
+    /// 取り消し可能な操作の直前に呼ぶ。現在状態を undo スタックへ積み、redo を破棄。
+    private func checkpoint() {
+        undoStack.append(makeSnapshot())
+        if undoStack.count > maxUndoDepth {
+            undoStack.removeFirst(undoStack.count - maxUndoDepth)
+        }
+        redoStack.removeAll()
+    }
+
+    private func restore(_ snap: DocSnapshot) {
+        layers = snap.layers.map { st in
+            let buf = makeDepositBuffer()! // 0 初期化されるが直後に上書き
+            st.deposit.withUnsafeBytes { raw in
+                memcpy(buf.contents(), raw.baseAddress!, min(buf.length, st.deposit.count))
+            }
+            return Layer(deposit: buf, visible: st.visible, opacity: st.opacity, name: st.name)
+        }
+        activeLayerIndex = min(max(snap.activeLayerIndex, 0), layers.count - 1)
+        layerCounter = snap.layerCounter
+        // ウェットは破棄
+        pendingStamps.removeAll()
+        lastStrokeSample = nil
+        activeDab = nil
+        for buf in [waterA, waterB, pigmentA, pigmentB] { memset(buf.contents(), 0, buf.length) }
+        rebuildComposites()
+    }
+
+    public func undo() {
+        guard canUndo else { return }
+        redoStack.append(makeSnapshot())
+        restore(undoStack.removeLast())
+    }
+
+    public func redo() {
+        guard canRedo else { return }
+        undoStack.append(makeSnapshot())
+        restore(redoStack.removeLast())
     }
 
     /// 可視レイヤーを下/上のアフィン変換 (A,B) へ畳み込む(レイヤー操作時のみ・低頻度)。
