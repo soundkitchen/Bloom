@@ -1,0 +1,67 @@
+# XcodeGen 定義。`xcodegen generate` で Bloom.xcodeproj を生成する。
+# .xcodeproj は生成物なので git 管理しない(.gitignore 参照)。
+name: Bloom
+options:
+  bundleIdPrefix: org.izukawa
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    # 手元のマシンにアプリとしてインストールするため Apple Development 証明書で実署名。
+    # 署名 ID が安定するので macOS の権限付与(アクセシビリティ/入力監視)が再ビルドでも保持される。
+    # ローカル実行の Mac アプリはプロビジョニングプロファイル不要なので手動署名にする
+    # (自動署名は "Mac Development" プロファイルを要求して証明書と噛み合わない)。
+    DEVELOPMENT_TEAM: MW2QV28AJE  # takanobu@izukawa.org
+    CODE_SIGN_STYLE: Manual
+    # 証明書をハッシュで直接指定(フレンドリ名だと "Mac Development" に解決されて失敗する)
+    CODE_SIGN_IDENTITY: EE6B5DD23861371C5050962730E7973F47BF4064
+    SWIFT_VERSION: "6.0"
+    # framework / テストバンドルに Info.plist を自動生成させる
+    # (ないと codesign が "bundle format unrecognized" で失敗する)
+    GENERATE_INFOPLIST_FILE: YES
+
+targets:
+  # ヘッドレスの描画コア。AppKit 非依存(MCP 対応・テストのため)
+  BloomCore:
+    type: framework
+    platform: macOS
+    sources:
+      - BloomCore
+
+  # macOS アプリ(コアの上の薄い殻)
+  BloomApp:
+    type: application
+    platform: macOS
+    sources:
+      - BloomApp
+    dependencies:
+      - target: BloomCore
+    info:
+      path: BloomApp/Info.plist
+      properties:
+        CFBundleDisplayName: Bloom
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+
+  BloomCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - BloomCoreTests
+    dependencies:
+      - target: BloomCore
+
+schemes:
+  BloomApp:
+    build:
+      targets:
+        BloomApp: all
+        BloomCoreTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - BloomCoreTests

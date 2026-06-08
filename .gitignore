@@ -1,0 +1,13 @@
+.DS_Store
+
+# XcodeGen の生成物
+*.xcodeproj
+
+# ビルド生成物
+build/
+DerivedData/
+.build/
+xcuserdata/
+
+# XcodeGen が生成する Info.plist
+BloomApp/Info.plist
