@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import BloomCore
 
 @MainActor
@@ -7,6 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var canvas: CanvasView?
     private var inspector: InspectorView?
     private var statusLabel: NSTextField?
+    private var documentURL: URL?
+
+    private var bloomType: UTType { UTType(filenameExtension: "bloom") ?? .data }
 
     private let inspectorWidth: CGFloat = 240
     private let statusHeight: CGFloat = 24
@@ -15,7 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
 
         let args = CommandLine.arguments
-        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo"]
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload"]
         if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
@@ -156,6 +160,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runUndoDemo(snapshotDir: snapshotDir)
             return
         }
+        if args.contains("--demo-saveload") {
+            runSaveLoadDemo(snapshotDir: snapshotDir)
+            return
+        }
 
         if args.contains("--demo") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -290,6 +298,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 保存/読み込み検証: 描く → 乾かす → .bloom 保存 → クリア → 読み込み → 復元を撮影
+    private func runSaveLoadDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+        let docURL = FileManager.default.temporaryDirectory.appendingPathComponent("bloom-roundtrip.bloom")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            engine.brush = .watercolor
+            engine.beginStroke()
+            for i in 0..<90 {
+                let t = Float(i) / 89
+                engine.addStrokeSample(
+                    at: SIMD2(0.12 * w + 0.76 * w * t, 0.5 * h + 0.15 * h * sin(t * .pi * 2.4)),
+                    pressure: 0.2 + 0.7 * sin(t * .pi))
+            }
+            engine.endStroke()
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+            try? engine.saveDocument(to: docURL) // 乾いた絵を保存
+            engine.clear()                       // キャンバスを消す
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.6) {
+            try? engine.savePNG(to: dir.appendingPathComponent("saveload-cleared.png")) // 空
+            try? engine.loadDocument(from: docURL) // 読み込みで復元
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.2) {
+            try? engine.savePNG(to: dir.appendingPathComponent("saveload-loaded.png")) // 復元
+            NSApp.terminate(nil)
+        }
+    }
+
     private func buildMenu() {
         let mainMenu = NSMenu()
 
@@ -300,6 +341,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(
             withTitle: "Quit Bloom", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"
         )
+
+        // ファイルメニュー(開く / 保存 / 書き出し)
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "ファイル")
+        fileItem.submenu = fileMenu
+        func add(_ menu: NSMenu, _ title: String, _ action: Selector,
+                 _ key: String, _ mods: NSEvent.ModifierFlags = .command) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mods
+            item.target = self
+            menu.addItem(item)
+        }
+        add(fileMenu, "開く…", #selector(openDocument), "o")
+        fileMenu.addItem(.separator())
+        add(fileMenu, "保存", #selector(saveDocument), "s")
+        add(fileMenu, "別名で保存…", #selector(saveDocumentAs), "s", [.command, .shift])
+        fileMenu.addItem(.separator())
+        add(fileMenu, "PNG を書き出す…", #selector(exportPNG), "e")
 
         // 編集メニュー(取り消す / やり直す)
         let editItem = NSMenuItem()
@@ -326,5 +386,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case #selector(redoAction): return canvas?.canRedo ?? false
         default: return true
         }
+    }
+
+    // MARK: - ファイル操作
+
+    @objc private func openDocument() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [bloomType]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try engine.loadDocument(from: url)
+            documentURL = url
+            refreshAfterDocumentChange()
+        } catch {
+            presentError(error, title: "開けませんでした")
+        }
+    }
+
+    @objc private func saveDocument() {
+        if let url = documentURL { save(to: url) } else { saveDocumentAs() }
+    }
+
+    @objc private func saveDocumentAs() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [bloomType]
+        panel.nameFieldStringValue = documentURL?.lastPathComponent ?? "無題.bloom"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        save(to: url)
+    }
+
+    @objc private func exportPNG() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = (documentURL?.deletingPathExtension().lastPathComponent ?? "無題") + ".png"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try engine.savePNG(to: url) } catch { presentError(error, title: "書き出せませんでした") }
+    }
+
+    private func save(to url: URL) {
+        guard let engine = canvas?.engine else { return }
+        do {
+            try engine.saveDocument(to: url)
+            documentURL = url
+            updateWindowTitle()
+        } catch {
+            presentError(error, title: "保存できませんでした")
+        }
+    }
+
+    private func refreshAfterDocumentChange() {
+        guard let canvas, let inspector else { return }
+        inspector.reflectLayers(canvas.layerInfos, activeRow: canvas.activeLayerRow)
+        updateWindowTitle()
+    }
+
+    private func updateWindowTitle() {
+        window?.title = "Bloom — " + (documentURL?.deletingPathExtension().lastPathComponent ?? "無題")
+    }
+
+    private func presentError(_ error: Error, title: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        if case let SimulationEngine.EngineError.documentFormat(msg) = error {
+            alert.informativeText = msg
+        } else {
+            alert.informativeText = error.localizedDescription
+        }
+        alert.runModal()
     }
 }

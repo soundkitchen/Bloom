@@ -23,6 +23,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - インスペクタの中身: ブラシ切替・カラーウェル(任意色)・サイズ/水量スライダ・**レイヤーリスト(NSTableView)**(目アイコンで表示切替、選択でアクティブ化、**行の D&D で並べ替え** → `moveLayer`、＋/🗑 で追加削除)・選択層の不透明スライダ・クリア
 - レイヤーリストは `reflectLayers` でエンジン状態を反映。プログラム選択時の `selectionDidChange` ループは `isReflecting` フラグで抑止
 - **編集メニュー**: 取り消す(Cmd+Z)/ やり直す(Cmd+Shift+Z)。`validateMenuItem` で `canUndo`/`canRedo` に応じて有効化
+- **ファイルメニュー**: 開く(Cmd+O)/ 保存(Cmd+S)/ 別名で保存(Cmd+Shift+S)/ PNG を書き出す(Cmd+E)。NSOpenPanel/NSSavePanel。現在のドキュメント URL を保持しウィンドウタイトルに反映
 - **検証モード**(`--demo` / `--demo-dwell`)はキャンバス全面の素のウィンドウにして、スナップショットにインスペクタが写り込まないようにする
 - エンジンのグリッドは生成時のキャンバスサイズで固定(ウィンドウは非リサイズ)
 
@@ -82,6 +83,16 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - **復元時にウェット(`W`/`P`/pending)は破棄**する(取り消し中の中途半端な濡れを残さない)。これにより redo の「乾き途中ストローク」の曖昧さも回避
 - 深さは `maxUndoDepth = 30` で頭打ち。スナップショットは全レイヤー deposit のコピーなので、メモリは概ね `深さ × レイヤー数 × (グリッド × 16B)`。将来、変更レイヤーだけの差分スナップショットで削減可能
 
+### ドキュメント保存/読み込み(`.bloom`)
+
+エンジンの実状態(レイヤーの `D` + メタデータ)をそのまま保存するラスタ形式。ストローク履歴は持たない(再生はこのシミュレーションでは脆いため)。
+
+- バイナリ書式(リトルエンディアン): magic `"BLM1"` / version / width / height / layerCount / activeIndex / layerCounter / 各層 { name, visible, opacity, deposit raw(`w*h*16`) }
+- **保存はウェット(`W`/`P`)を含まない** = 乾いて沈着した絵を保存する。紙テクスチャは寸法から決定的なので保存しない
+- 読み込みは**キャンバス寸法の一致を検証**(エンジンのグリッドは生成時固定)。不一致・不正 magic・バージョン不一致は `EngineError.documentFormat` を投げる
+- 読み込み時に undo/redo 履歴とウェットをリセット(新しいドキュメント扱い)
+- API: `saveDocument(to:)` / `loadDocument(from:)` / 画像は既存の `savePNG(to:)`
+
 ### チューニングパラメータ(SimulationEngine.SimParams)
 
 | パラメータ | 現在値 | 効果 |
@@ -119,7 +130,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - **Makefile**: `make run / test / demo`。DerivedData はリポジトリ外(`~/Library/Developer/Xcode/DerivedData/Bloom-cli`)— Dropbox 同期ノイズ回避
 - **検証**: `make demo` がデモストロークを自動実行し、wet(直後)/ dry(乾燥後)の PNG を `/tmp/bloom-snap` に出力。描き味チューニングはこのループで回す
   - ドウェル(置きっぱなし)の確認は `BloomApp --demo-dwell --snapshot-dir <dir>` → `pooled.png`(溜まり)/ `dried.png`(乾いた輪っか)
-  - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`(`undo-before.png` / `undo-after.png`)
+  - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`、保存/読み込みは `--demo-saveload`(描く→保存→消去→読込で復元を確認)
 
 ### ハマりどころ(再発時のために)
 
