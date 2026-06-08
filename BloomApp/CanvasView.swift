@@ -27,11 +27,30 @@ final class CanvasView: MTKView {
     func moveLayer(from: Int, to: Int) { engine?.moveLayer(fromRow: from, toRow: to); onLayersChanged?() }
     func setLayerOpacity(row: Int, opacity: Float) { engine?.setLayerOpacity(row: row, opacity: opacity) }
 
-    // Undo / Redo（レイヤー数が変わりうるのでインスペクタも更新）
+    // Undo / Redo（レイヤー・フレーム数が変わりうるので両方更新）
     var canUndo: Bool { engine?.canUndo ?? false }
     var canRedo: Bool { engine?.canRedo ?? false }
-    func undo() { engine?.undo(); onLayersChanged?() }
-    func redo() { engine?.redo(); onLayersChanged?() }
+    func undo() { engine?.undo(); onLayersChanged?(); onTimelineChanged?() }
+    func redo() { engine?.redo(); onLayersChanged?(); onTimelineChanged?() }
+
+    // タイムライン / フレーム
+    var onTimelineChanged: (() -> Void)?
+    var isPlaying = false
+
+    var frameTotal: Int { engine?.frameTotal ?? 1 }
+    var currentFrameIndex: Int { engine?.currentFrameIndex ?? 0 }
+    var onionEnabled: Bool { engine?.onionEnabled ?? false }
+
+    func addFrame() { engine?.addFrame(); onTimelineChanged?() }
+    func duplicateFrame() { engine?.duplicateFrame(); onTimelineChanged?() }
+    func deleteFrame() { engine?.deleteFrame(); onTimelineChanged?() }
+    func goToFrame(_ f: Int) { engine?.goToFrame(f); onTimelineChanged?() }
+    func setOnion(_ on: Bool) { engine?.setOnionEnabled(on); onTimelineChanged?() }
+    func stepFrameLooping() {
+        guard let e = engine else { return }
+        e.goToFrame((e.currentFrameIndex + 1) % max(e.frameTotal, 1))
+        onTimelineChanged?()
+    }
 
     override init(frame: CGRect, device: MTLDevice?) {
         super.init(frame: frame, device: device)
@@ -68,16 +87,19 @@ final class CanvasView: MTKView {
     // MARK: - 入力
 
     override func mouseDown(with event: NSEvent) {
+        guard !isPlaying else { return } // 再生中は描かない
         pressureEstimator.reset()
         engine?.beginStroke()
         addSample(from: event)
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard !isPlaying else { return }
         addSample(from: event)
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard !isPlaying else { return }
         engine?.endStroke()
     }
 

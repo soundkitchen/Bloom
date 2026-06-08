@@ -24,6 +24,7 @@ struct SimParams {
     float activeFactor;    // render でアクティブ層を合成する係数(非表示なら 0)
     float coverageK;       // 顔料量 → 被覆(不透明度)への変換係数
     float activeOpacity;   // アクティブ層の不透明度
+    float onionFactor;     // オニオンスキン(前フレーム)の表示強度。0 で無効
 };
 
 // --- レイヤー合成のヘルパー(アフィングレーズ)-------------------------
@@ -234,6 +235,8 @@ kernel void renderKernel(texture2d<float, access::write> out [[texture(0)]],
                          device const float3* Dactive [[buffer(6)]],
                          device const float*  H       [[buffer(7)]],
                          constant SimParams&  prm     [[buffer(8)]],
+                         device const float3* onionA  [[buffer(9)]],
+                         device const float3* onionB  [[buffer(10)]],
                          uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
@@ -256,6 +259,17 @@ kernel void renderKernel(texture2d<float, access::write> out [[texture(0)]],
         r = L.a * r + L.b;
     }
     r = aA * r + aB;                                             // 上層
+
+    // オニオンスキン: 前フレームの色(白地)= onionA*1 + onionB。インクのある所に薄く暖色で。
+    if (prm.onionFactor > 0.001) {
+        float3 onA = sampleBilinear3(onionA, g, prm.width, prm.height);
+        float3 onB = sampleBilinear3(onionB, g, prm.width, prm.height);
+        float3 onionColor = onA + onB;
+        float onionInk = clamp((1.0 - dot(onionColor, float3(0.333))) * 3.0, 0.0, 1.0);
+        float curBlank = clamp((dot(r, float3(0.333)) - 0.7) * 3.0, 0.0, 1.0);
+        float3 tinted = onionColor * float3(1.0, 0.85, 0.78); // 前フレームは暖色寄り
+        r = mix(r, tinted, prm.onionFactor * onionInk * curBlank);
+    }
 
     r *= 1.0 - 0.06 * clamp(ws, 0.0, 1.0); // 濡れ艶
     out.write(float4(r, 1.0), gid);

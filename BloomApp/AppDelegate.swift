@@ -7,19 +7,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var canvas: CanvasView?
     private var inspector: InspectorView?
+    private var timeline: TimelineView?
     private var statusLabel: NSTextField?
     private var documentURL: URL?
+    private var playTimer: Timer?
+    private var playFps: Double = 12
 
     private var bloomType: UTType { UTType(filenameExtension: "bloom") ?? .data }
 
     private let inspectorWidth: CGFloat = 240
     private let statusHeight: CGFloat = 24
+    private let timelineHeight: CGFloat = 56
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
 
         let args = CommandLine.arguments
-        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload"]
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion"]
         if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
@@ -33,29 +37,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         handleLaunchArguments()
     }
 
-    /// 通常起動: 中央キャンバス + 右インスペクタ + 下ステータスバー
+    /// 通常起動: 中央キャンバス + 右インスペクタ + 下タイムライン + ステータスバー
     private func buildInteractiveWindow() {
         let winSize = NSSize(width: 1024, height: 720)
-        let canvasRect = NSRect(
-            x: 0, y: statusHeight,
-            width: winSize.width - inspectorWidth, height: winSize.height - statusHeight
-        )
-        let canvas = CanvasView(frame: canvasRect, device: nil)
+        let lowerH = statusHeight + timelineHeight // キャンバス/インスペクタ下端の余白
+        let upperH = winSize.height - lowerH
+
+        let canvas = CanvasView(frame: NSRect(
+            x: 0, y: lowerH, width: winSize.width - inspectorWidth, height: upperH
+        ), device: nil)
         canvas.autoresizingMask = [.width, .height]
         self.canvas = canvas
 
         let inspector = InspectorView(frame: NSRect(
-            x: winSize.width - inspectorWidth, y: statusHeight,
-            width: inspectorWidth, height: winSize.height - statusHeight
+            x: winSize.width - inspectorWidth, y: lowerH, width: inspectorWidth, height: upperH
         ))
         inspector.autoresizingMask = [.minXMargin, .height]
         self.inspector = inspector
+
+        let timeline = TimelineView(frame: NSRect(
+            x: 0, y: statusHeight, width: winSize.width, height: timelineHeight
+        ))
+        timeline.autoresizingMask = [.width, .maxYMargin]
+        self.timeline = timeline
 
         let statusBar = makeStatusBar(width: winSize.width)
 
         let container = NSView(frame: NSRect(origin: .zero, size: winSize))
         container.addSubview(canvas)
         container.addSubview(inspector)
+        container.addSubview(timeline)
         container.addSubview(statusBar)
 
         // 配線: キャンバス ⇄ インスペクタ ⇄ ステータス
@@ -78,6 +89,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             inspector.reflectLayers(canvas.layerInfos, activeRow: canvas.activeLayerRow)
         }
 
+        // 配線: タイムライン
+        timeline.onAddFrame = { [weak canvas] in canvas?.addFrame() }
+        timeline.onDuplicateFrame = { [weak canvas] in canvas?.duplicateFrame() }
+        timeline.onDeleteFrame = { [weak canvas] in canvas?.deleteFrame() }
+        timeline.onSelectFrame = { [weak canvas] in canvas?.goToFrame($0) }
+        timeline.onPrev = { [weak self] in self?.stepFrame(-1) }
+        timeline.onNext = { [weak self] in self?.stepFrame(+1) }
+        timeline.onPlayToggle = { [weak self] in self?.togglePlay() }
+        timeline.onOnionToggle = { [weak canvas] in canvas?.setOnion($0) }
+        timeline.onFpsChange = { [weak self] in self?.playFps = $0 }
+        canvas.onTimelineChanged = { [weak self] in self?.refreshTimeline() }
+
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: winSize),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -92,6 +115,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let brush = canvas.currentBrush { canvas.selectBrush(brush) } // 初期状態を UI に反映
         inspector.reflectLayers(canvas.layerInfos, activeRow: canvas.activeLayerRow)
+        refreshTimeline()
+    }
+
+    // MARK: - タイムライン / 再生
+
+    private func stepFrame(_ delta: Int) {
+        guard let canvas else { return }
+        canvas.goToFrame(canvas.currentFrameIndex + delta)
+    }
+
+    private func togglePlay() {
+        guard let canvas else { return }
+        if canvas.isPlaying {
+            playTimer?.invalidate(); playTimer = nil
+            canvas.isPlaying = false
+        } else {
+            canvas.isPlaying = true
+            playTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / max(playFps, 1), repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.canvas?.stepFrameLooping() }
+            }
+        }
+        refreshTimeline()
+    }
+
+    private func refreshTimeline() {
+        guard let canvas, let timeline else { return }
+        timeline.reflect(frameTotal: canvas.frameTotal, current: canvas.currentFrameIndex,
+                         isPlaying: canvas.isPlaying, onion: canvas.onionEnabled)
     }
 
     /// 検証モード: キャンバスのみのウィンドウ
@@ -162,6 +213,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--demo-saveload") {
             runSaveLoadDemo(snapshotDir: snapshotDir)
+            return
+        }
+        if args.contains("--demo-anim") {
+            runAnimDemo(snapshotDir: snapshotDir)
+            return
+        }
+        if args.contains("--demo-onion") {
+            runOnionDemo(snapshotDir: snapshotDir)
             return
         }
 
@@ -331,6 +390,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// アニメ書き出し検証: ドットが動く数フレームを作り、GIF/スプライト/連番を書き出す。
+    /// 各フレームは低水ブラシで素早く沈着させ、次フレームへ移る前に乾燥時間を取る。
+    private func runAnimDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+        var dot = SimulationEngine.Brush.sumi  // 低水で速く沈着
+        dot.color = SIMD3(0.20, 0.30, 0.62)
+        dot.baseRadius = 26
+        let frames = 6
+        let step = 1.4 // 1 フレームの描画 + 乾燥に充てる秒数
+
+        func drawDot(_ i: Int) {
+            engine.brush = dot
+            let x = 0.15 * w + 0.7 * w * Float(i) / Float(frames - 1)
+            let y = 0.5 * h - 0.25 * h * sin(Float(i) / Float(frames - 1) * .pi)
+            engine.beginStroke()
+            engine.addStrokeSample(at: SIMD2(x, y), pressure: 1.0)
+            engine.addStrokeSample(at: SIMD2(x + 1, y), pressure: 1.0)
+            engine.endStroke()
+        }
+
+        for i in 0..<frames {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + step * Double(i)) {
+                if i > 0 { engine.addFrame() }
+                drawDot(i)
+            }
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + step * Double(frames) + 1.5) {
+            try? engine.exportGIF(to: dir.appendingPathComponent("anim.gif"), fps: 8)
+            try? engine.exportSpriteSheet(to: dir.appendingPathComponent("sheet.png"))
+            try? engine.exportPNGSequence(to: dir.appendingPathComponent("seq"))
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// オニオン検証: frame0 に波線 → frame1(空)で オニオン on → 前フレームが透ける
+    private func runOnionDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            engine.brush = .watercolor
+            engine.beginStroke()
+            for i in 0..<90 {
+                let t = Float(i) / 89
+                engine.addStrokeSample(
+                    at: SIMD2(0.12 * w + 0.76 * w * t, 0.5 * h + 0.18 * h * sin(t * .pi * 2.4)),
+                    pressure: 0.25 + 0.7 * sin(t * .pi))
+            }
+            engine.endStroke()
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) {
+            engine.addFrame()             // frame1 へ(初期は保持 = 前フレームをフル表示)
+            engine.clear()                // 空のキーフレームにして保持を切る
+            engine.setOnionEnabled(true)  // 前フレームを薄く表示(ゴースト)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.2) {
+            try? engine.savePNG(to: dir.appendingPathComponent("onion-frame2.png"))
+            engine.setOnionEnabled(false)
+            try? engine.savePNG(to: dir.appendingPathComponent("onion-off.png"))
+            NSApp.terminate(nil)
+        }
+    }
+
     private func buildMenu() {
         let mainMenu = NSMenu()
 
@@ -360,6 +486,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(fileMenu, "別名で保存…", #selector(saveDocumentAs), "s", [.command, .shift])
         fileMenu.addItem(.separator())
         add(fileMenu, "PNG を書き出す…", #selector(exportPNG), "e")
+        add(fileMenu, "GIF を書き出す…", #selector(exportGIF), "g")
+        add(fileMenu, "スプライトシートを書き出す…", #selector(exportSpriteSheet), "g", [.command, .shift])
+        add(fileMenu, "PNG 連番を書き出す…", #selector(exportPNGSequence), "")
 
         // 編集メニュー(取り消す / やり直す)
         let editItem = NSMenuItem()
@@ -374,11 +503,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(undoItem)
         editMenu.addItem(redoItem)
 
+        // フレームメニュー(アニメーション)
+        let frameItem = NSMenuItem()
+        mainMenu.addItem(frameItem)
+        let frameMenu = NSMenu(title: "フレーム")
+        frameItem.submenu = frameMenu
+        add(frameMenu, "新規フレーム", #selector(menuAddFrame), "n", [.command, .shift])
+        add(frameMenu, "フレームを複製", #selector(menuDuplicateFrame), "d", [.command, .shift])
+        add(frameMenu, "フレームを削除", #selector(menuDeleteFrame), "")
+        frameMenu.addItem(.separator())
+        add(frameMenu, "前のフレーム", #selector(menuPrevFrame), ",")
+        add(frameMenu, "次のフレーム", #selector(menuNextFrame), ".")
+        add(frameMenu, "再生 / 停止", #selector(menuTogglePlay), "p")
+
         NSApp.mainMenu = mainMenu
     }
 
     @objc private func undoAction() { canvas?.undo() }
     @objc private func redoAction() { canvas?.redo() }
+    @objc private func menuAddFrame() { canvas?.addFrame() }
+    @objc private func menuDuplicateFrame() { canvas?.duplicateFrame() }
+    @objc private func menuDeleteFrame() { canvas?.deleteFrame() }
+    @objc private func menuPrevFrame() { stepFrame(-1) }
+    @objc private func menuNextFrame() { stepFrame(+1) }
+    @objc private func menuTogglePlay() { togglePlay() }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
@@ -417,13 +565,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         save(to: url)
     }
 
+    private var exportBaseName: String { documentURL?.deletingPathExtension().lastPathComponent ?? "無題" }
+
     @objc private func exportPNG() {
         guard let engine = canvas?.engine else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
-        panel.nameFieldStringValue = (documentURL?.deletingPathExtension().lastPathComponent ?? "無題") + ".png"
+        panel.nameFieldStringValue = exportBaseName + ".png"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try engine.savePNG(to: url) } catch { presentError(error, title: "書き出せませんでした") }
+    }
+
+    @objc private func exportGIF() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.gif]
+        panel.nameFieldStringValue = exportBaseName + ".gif"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try engine.exportGIF(to: url, fps: 12) } catch { presentError(error, title: "GIF を書き出せませんでした") }
+    }
+
+    @objc private func exportSpriteSheet() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = exportBaseName + "_sheet.png"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try engine.exportSpriteSheet(to: url) } catch { presentError(error, title: "スプライトシートを書き出せませんでした") }
+    }
+
+    @objc private func exportPNGSequence() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "ここへ書き出す"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        do {
+            try engine.exportPNGSequence(to: dir.appendingPathComponent(exportBaseName + "_seq"))
+        } catch { presentError(error, title: "PNG 連番を書き出せませんでした") }
     }
 
     private func save(to url: URL) {

@@ -10,6 +10,10 @@ import UniformTypeIdentifiers
 /// グリッド上に 4 つの場を持つ:
 /// - W: 水量 / P: 浮遊顔料 / D: 沈着済み顔料(乾いた絵) / H: 紙の凹凸(静的)
 /// 毎フレーム stamp → (flow → dry) × substeps → render の順で回す。
+///
+/// アニメーション(セル方式): レイヤー = トラックがフレームをまたいで存在し、
+/// 各トラックがフレームごとに「セル(deposit バッファ)」を持つ。セルが無いフレームは
+/// 直前のセルを保持(hold)する。表示・描画はすべて currentFrame の解決後セルに対して行う。
 @MainActor
 public final class SimulationEngine {
 
@@ -28,15 +32,17 @@ public final class SimulationEngine {
         var activeFactor: Float = 1.0  // render でアクティブ層を合成する係数(非表示なら 0)
         var coverageK: Float = 0.9     // 顔料量 → 被覆(不透明度)への変換係数
         var activeOpacity: Float = 1.0 // アクティブ層の不透明度
+        var onionFactor: Float = 0     // オニオンスキン(前フレーム)の表示強度
     }
 
-    /// レイヤー: 乾いた顔料(deposit)を持つ。ウェットシミュレーション(W/P)は共有で、
-    /// 乾燥沈着はアクティブ層の deposit に積まれる。
-    private struct Layer {
-        var deposit: MTLBuffer // float3 RGB 吸光度
+    /// レイヤー(トラック): フレームごとのセル(乾いた顔料 deposit)を持つ。
+    /// cels[f] == nil は「保持(直前のセルを表示)」。cels.count == frameCount。
+    private struct LayerTrack {
+        var cels: [MTLBuffer?]
         var visible: Bool
         var opacity: Float
         var name: String
+        let id: Int // 並べ替え時にアクティブを追従させるための安定 ID
     }
 
     /// UI 向けのレイヤー情報(読み取り専用)
@@ -101,17 +107,28 @@ public final class SimulationEngine {
     private var pigmentB: MTLBuffer
     private let paper: MTLBuffer
     private let stampBuffer: MTLBuffer
+    private let emptyDeposit: MTLBuffer   // 常に 0。解決後セルが無い表示の合成で使う
+    private let scratchDeposit: MTLBuffer // 描画ターゲットが無いときの乾燥出力ダンプ(表示しない)
 
-    // レイヤー。乾燥沈着はアクティブ層に積み、render は可視層を順序合成する。
-    private var layers: [Layer] = []
-    private var activeLayerIndex = 0
-    private var layerCounter = 0
-    // アクティブ層より下/上の可視層を畳み込んだアフィン変換 (A, B)。レイヤー操作時に再構築。
+    // タイムライン。各トラックが currentFrame のセルに解決され、可視層を順序合成する。
+    private var tracks: [LayerTrack] = []
+    private var frameCount = 1
+    private var currentFrame = 0
+    private var activeTrackIndex = 0
+    private var trackCounter = 0   // 既定名 "レイヤー N" 用
+    private var trackIdSeq = 0     // 安定 ID 採番
+
+    // アクティブ層より下/上の可視層を畳み込んだアフィン変換 (A, B)。レイヤー/フレーム操作時に再構築。
     // 色 r に対し r → A·r + B。A は単位元 1、B は 0 で初期化。
     private let belowA: MTLBuffer
     private let belowB: MTLBuffer
     private let aboveA: MTLBuffer
     private let aboveB: MTLBuffer
+    // オニオンスキン: 前フレームの全可視トラックを畳み込んだアフィン (A,B)。フレーム移動時に再構築。
+    private let onionA: MTLBuffer
+    private let onionB: MTLBuffer
+    public private(set) var onionEnabled = false
+    private let onionStrength: Float = 0.4
 
     private var params: SimParams
     private var pendingStamps: [Stamp] = []
@@ -122,8 +139,6 @@ public final class SimulationEngine {
     private let maxStampsPerFrame = 1024
 
     /// 筆を下ろし続けている間の単位フレームあたりの供給量(止めていても滲みが育つ)。
-    /// 120fps を前提にした控えめな値。フレームレート非依存化は将来課題。
-    /// 広がりは水が駆動するので water を厚めに、顔料は前線まで運ばれて溜まる程度に。
     private let dwellWaterRate: Float = 0.08
     private let dwellPigmentRate: Float = 0.018
 
@@ -172,20 +187,29 @@ public final class SimulationEngine {
         belowB = try makeBuffer(vector3Bytes)
         aboveA = try makeBuffer(vector3Bytes)
         aboveB = try makeBuffer(vector3Bytes)
+        emptyDeposit = try makeBuffer(vector3Bytes)
+        scratchDeposit = try makeBuffer(vector3Bytes)
+        onionA = try makeBuffer(vector3Bytes)
+        onionB = try makeBuffer(vector3Bytes)
+        memset(emptyDeposit.contents(), 0, emptyDeposit.length)
         guard let sb = device.makeBuffer(
             length: maxStampsPerFrame * MemoryLayout<Stamp>.stride,
             options: .storageModeShared
         ) else { throw EngineError.pipelineFailed("stamp buffer") }
         stampBuffer = sb
 
-        // 最初のレイヤーを 1 枚用意
-        layerCounter = 1
-        layers = [Layer(deposit: try makeBuffer(vector3Bytes), visible: true,
-                        opacity: 1.0, name: "レイヤー 1")]
-        activeLayerIndex = 0
+        // 最初のトラックを 1 枚、フレーム 0 にセルを 1 枚持たせる
+        frameCount = 1
+        currentFrame = 0
+        trackCounter = 1
+        trackIdSeq = 1
+        let firstCel = try makeBuffer(vector3Bytes)
+        memset(firstCel.contents(), 0, firstCel.length)
+        tracks = [LayerTrack(cels: [firstCel], visible: true, opacity: 1.0, name: "レイヤー 1", id: 1)]
+        activeTrackIndex = 0
 
-        zeroWetAndActiveDeposit() // ウェット + アクティブ層 deposit を 0 に(init は履歴に積まない)
-        rebuildComposites()       // below/above を 0 に(初期は他層なし)
+        zeroWet()
+        rebuildComposites()
         generatePaperTexture()
     }
 
@@ -200,10 +224,40 @@ public final class SimulationEngine {
         return b
     }
 
+    // MARK: - セル解決
+
+    /// トラック t・フレーム f の表示セル(hold: f 以下で最後に非 nil のセル)
+    private func resolvedCel(_ t: Int, _ f: Int) -> MTLBuffer? {
+        var i = min(f, frameCount - 1)
+        while i >= 0 {
+            if let c = tracks[t].cels[i] { return c }
+            i -= 1
+        }
+        return nil
+    }
+
+    /// アクティブトラックの現フレーム表示セル(無ければ emptyDeposit)
+    private var activeDisplayCel: MTLBuffer { resolvedCel(activeTrackIndex, currentFrame) ?? emptyDeposit }
+    private var activeHasVisibleCel: Bool {
+        tracks[activeTrackIndex].visible && resolvedCel(activeTrackIndex, currentFrame) != nil
+    }
+    /// 乾燥沈着の出力先。描画中はアクティブセル、無ければ scratch(表示されない)
+    private var dryTarget: MTLBuffer { tracks[activeTrackIndex].cels[currentFrame] ?? scratchDeposit }
+
+    /// 現フレームのアクティブトラックに描けるセルを保証(hold を切って新原画を作る)
+    @discardableResult
+    private func ensureActiveDrawCel() -> MTLBuffer {
+        if let c = tracks[activeTrackIndex].cels[currentFrame] { return c }
+        guard let buf = makeDepositBuffer() else { return scratchDeposit }
+        tracks[activeTrackIndex].cels[currentFrame] = buf
+        return buf
+    }
+
     // MARK: - 公開 API(コアへの「コマンド」。将来 MCP からも同じ口を叩く)
 
     public func beginStroke() {
-        checkpoint() // ストロークを 1 つの取り消し単位にする
+        checkpoint()              // ストロークを 1 つの取り消し単位にする
+        ensureActiveDrawCel()     // 現フレームに描けるセルを用意(保持を切る)
         lastStrokeSample = nil
         activeDab = nil
     }
@@ -221,7 +275,6 @@ public final class SimulationEngine {
         let spacing = max(stampRadius(pressure: sample.pressure) * 0.3, 1.5)
         let steps = min(Int(dist / spacing), 200)
         // 間隔未満の移動ではスタンプを打たず、アンカーも進めない。
-        // こうしないと距離が毎イベントでリセットされ、ゆっくり描くと永遠に閾値を超えない。
         guard steps > 0 else { return }
         for i in 1...steps {
             let t = Float(i) / Float(steps)
@@ -230,17 +283,15 @@ public final class SimulationEngine {
                 pressure: last.pressure + (sample.pressure - last.pressure) * t
             ))
         }
-        // 最後のスタンプはちょうど sample 位置(t=1)に乗るので、ここをアンカーにする
         lastStrokeSample = sample
     }
 
     public func endStroke() {
         lastStrokeSample = nil
-        activeDab = nil // ペンを上げたらドウェル供給を止める(あとは広がって乾くだけ)
+        activeDab = nil
     }
 
     /// 筆を下ろし続けている間、動かさなくても水・顔料を継ぎ足す(滲み・溜まりが育つ)。
-    /// renderFrame から毎フレーム呼ばれる。穂の芯から染み出すイメージで細め・少量。
     internal func emitDwellStamp() {
         guard let dab = activeDab, pendingStamps.count < maxStampsPerFrame else { return }
         pendingStamps.append(Stamp(
@@ -255,156 +306,229 @@ public final class SimulationEngine {
     /// テスト用: 次フレームで描画待ちのスタンプ数
     internal var pendingStampCount: Int { pendingStamps.count }
 
-    private var activeDeposit: MTLBuffer { layers[activeLayerIndex].deposit }
-
-    private func zeroWetAndActiveDeposit() {
-        pendingStamps.removeAll()
-        for buf in [waterA, waterB, pigmentA, pigmentB, activeDeposit] {
-            memset(buf.contents(), 0, buf.length)
-        }
+    /// テスト用: 指定行(上=手前)のトラックがそのフレームに実セルを持つか(hold 検証用)
+    internal func celExists(trackRow: Int, frame: Int) -> Bool {
+        let t = tracks.count - 1 - trackRow
+        guard tracks.indices.contains(t), tracks[t].cels.indices.contains(frame) else { return false }
+        return tracks[t].cels[frame] != nil
     }
 
-    /// アクティブ層と乾き途中のウェットをクリア(他の層は残す)。取り消し可能。
+    private func zeroWet() {
+        pendingStamps.removeAll()
+        for buf in [waterA, waterB, pigmentA, pigmentB] { memset(buf.contents(), 0, buf.length) }
+    }
+
+    /// アクティブトラックの現フレームのセルとウェットをクリア(他は残す)。取り消し可能。
     public func clear() {
         checkpoint()
-        zeroWetAndActiveDeposit()
+        let cel = ensureActiveDrawCel() // 保持フレームなら空セルを作って上書き
+        memset(cel.contents(), 0, cel.length)
+        zeroWet()
+        rebuildComposites()
     }
 
-    // MARK: - レイヤー操作(コアへのコマンド。将来 MCP からも叩く)
+    // MARK: - レイヤー(トラック)操作
 
     /// UI 向け: 上が手前(末尾が最前面)になるよう逆順で返す
     public var layerInfos: [LayerInfo] {
-        layers.reversed().map { LayerInfo(name: $0.name, visible: $0.visible, opacity: $0.opacity) }
+        tracks.reversed().map { LayerInfo(name: $0.name, visible: $0.visible, opacity: $0.opacity) }
+    }
+    public var activeLayerRow: Int { tracks.count - 1 - activeTrackIndex }
+    public var layerCount: Int { tracks.count }
+
+    private func newTrack(name: String) -> LayerTrack {
+        trackIdSeq += 1
+        return LayerTrack(cels: Array(repeating: nil, count: frameCount),
+                          visible: true, opacity: 1.0, name: name, id: trackIdSeq)
     }
 
-    /// layerInfos と同じ並び(逆順)でのアクティブ位置
-    public var activeLayerRow: Int { layers.count - 1 - activeLayerIndex }
-
-    public var layerCount: Int { layers.count }
-
     public func addLayer() {
-        guard let buf = makeDepositBuffer() else { return }
         checkpoint()
-        layerCounter += 1
-        // アクティブ層の 1 つ上(手前)に挿入してそこをアクティブに
-        layers.insert(Layer(deposit: buf, visible: true, opacity: 1.0,
-                            name: "レイヤー \(layerCounter)"), at: activeLayerIndex + 1)
-        activeLayerIndex += 1
+        trackCounter += 1
+        tracks.insert(newTrack(name: "レイヤー \(trackCounter)"), at: activeTrackIndex + 1)
+        activeTrackIndex += 1
         endStroke()
         rebuildComposites()
     }
 
-    /// layerInfos の行番号(逆順)で削除。最低 1 枚は残す。
     public func deleteLayer(row: Int) {
-        guard layers.count > 1 else { return }
-        let index = layers.count - 1 - row
-        guard layers.indices.contains(index) else { return }
+        guard tracks.count > 1 else { return }
+        let index = tracks.count - 1 - row
+        guard tracks.indices.contains(index) else { return }
         checkpoint()
-        layers.remove(at: index)
-        if index < activeLayerIndex {
-            activeLayerIndex -= 1                                   // 下の層が詰めた
-        } else if index == activeLayerIndex {
-            activeLayerIndex = min(activeLayerIndex, layers.count - 1) // 削除した位置に来た層へ
+        tracks.remove(at: index)
+        if index < activeTrackIndex {
+            activeTrackIndex -= 1
+        } else if index == activeTrackIndex {
+            activeTrackIndex = min(activeTrackIndex, tracks.count - 1)
         }
         endStroke()
         rebuildComposites()
     }
 
     public func setActiveLayer(row: Int) {
-        let index = layers.count - 1 - row
-        guard layers.indices.contains(index), index != activeLayerIndex else { return }
-        activeLayerIndex = index
+        let index = tracks.count - 1 - row
+        guard tracks.indices.contains(index), index != activeTrackIndex else { return }
+        activeTrackIndex = index
         endStroke()
         rebuildComposites()
     }
 
     public func toggleLayerVisible(row: Int) {
-        let index = layers.count - 1 - row
-        guard layers.indices.contains(index) else { return }
-        layers[index].visible.toggle()
+        let index = tracks.count - 1 - row
+        guard tracks.indices.contains(index) else { return }
+        tracks[index].visible.toggle()
         rebuildComposites()
     }
 
     public func setLayerOpacity(row: Int, opacity: Float) {
-        let index = layers.count - 1 - row
-        guard layers.indices.contains(index) else { return }
-        layers[index].opacity = min(max(opacity, 0), 1)
+        let index = tracks.count - 1 - row
+        guard tracks.indices.contains(index) else { return }
+        tracks[index].opacity = min(max(opacity, 0), 1)
         rebuildComposites()
     }
 
     /// 行(上=手前)を fromRow から toRow へ移動。toRow は NSTableView の挿入位置の意味。
     public func moveLayer(fromRow: Int, toRow: Int) {
-        var rows = Array(layers.reversed()) // rows[0] = 手前
+        var rows = Array(tracks.reversed()) // rows[0] = 手前
         guard rows.indices.contains(fromRow) else { return }
         checkpoint()
-        let activeBuf = layers[activeLayerIndex].deposit // 同一性でアクティブを追従
+        let activeId = tracks[activeTrackIndex].id
         let moved = rows.remove(at: fromRow)
         var dest = toRow
-        if toRow > fromRow { dest -= 1 } // 削除で 1 つ詰まる分を補正
+        if toRow > fromRow { dest -= 1 }
         dest = max(0, min(dest, rows.count))
         rows.insert(moved, at: dest)
-        layers = Array(rows.reversed())
-        activeLayerIndex = layers.firstIndex { $0.deposit === activeBuf } ?? activeLayerIndex
+        tracks = Array(rows.reversed())
+        activeTrackIndex = tracks.firstIndex { $0.id == activeId } ?? activeTrackIndex
         endStroke()
         rebuildComposites()
     }
 
-    // MARK: - Undo / Redo(スナップショット方式)
-    //
-    // 流体シミュレーションは連続的でコマンド再生が難しいため、取り消し可能な操作の
-    // 直前に全レイヤーの deposit(乾いた絵)+ メタデータをコピーして保存する。
-    // ウェット(W/P)は復元時に破棄する(取り消し中の中途半端な濡れを残さない)。
+    // MARK: - フレーム操作
 
-    private struct LayerState {
-        let deposit: Data
+    public var frameTotal: Int { frameCount }
+    public var currentFrameIndex: Int { currentFrame }
+
+    /// 現フレームの後ろに空(保持)フレームを挿入してそこへ移動
+    public func addFrame() {
+        checkpoint()
+        for t in tracks.indices { tracks[t].cels.insert(nil, at: currentFrame + 1) }
+        frameCount += 1
+        currentFrame += 1
+        endStroke()
+        rebuildComposites()
+    }
+
+    /// 現フレームの内容を複製した独立フレームを後ろに挿入してそこへ移動
+    public func duplicateFrame() {
+        checkpoint()
+        for t in tracks.indices {
+            let copy: MTLBuffer?
+            if let src = resolvedCel(t, currentFrame), let dst = makeDepositBuffer() {
+                memcpy(dst.contents(), src.contents(), dst.length)
+                copy = dst
+            } else {
+                copy = nil
+            }
+            tracks[t].cels.insert(copy, at: currentFrame + 1)
+        }
+        frameCount += 1
+        currentFrame += 1
+        endStroke()
+        rebuildComposites()
+    }
+
+    /// 現フレームを削除(最低 1 フレームは残す)
+    public func deleteFrame() {
+        guard frameCount > 1 else { return }
+        checkpoint()
+        for t in tracks.indices { tracks[t].cels.remove(at: currentFrame) }
+        frameCount -= 1
+        currentFrame = min(currentFrame, frameCount - 1)
+        endStroke()
+        rebuildComposites()
+    }
+
+    /// フレーム移動(履歴には積まない。ウェットは破棄)
+    public func goToFrame(_ f: Int) {
+        let target = min(max(f, 0), frameCount - 1)
+        guard target != currentFrame else { return }
+        endStroke()
+        zeroWet()
+        currentFrame = target
+        rebuildComposites()
+    }
+
+    public func setOnionEnabled(_ on: Bool) {
+        onionEnabled = on
+        rebuildOnion()
+    }
+
+    // MARK: - Undo / Redo(スナップショット方式・タイムライン全体)
+
+    private struct TrackState {
+        let cels: [Data?]
         let visible: Bool
         let opacity: Float
         let name: String
+        let id: Int
     }
     private struct DocSnapshot {
-        let layers: [LayerState]
-        let activeLayerIndex: Int
-        let layerCounter: Int
+        let tracks: [TrackState]
+        let frameCount: Int
+        let currentFrame: Int
+        let activeTrackIndex: Int
+        let trackCounter: Int
+        let trackIdSeq: Int
     }
     private var undoStack: [DocSnapshot] = []
     private var redoStack: [DocSnapshot] = []
-    private let maxUndoDepth = 30
+    private let maxUndoDepth = 15 // タイムライン全体を持つのでやや浅め
 
     public var canUndo: Bool { !undoStack.isEmpty }
     public var canRedo: Bool { !redoStack.isEmpty }
 
     private func makeSnapshot() -> DocSnapshot {
-        let states = layers.map {
-            LayerState(deposit: Data(bytes: $0.deposit.contents(), count: $0.deposit.length),
-                       visible: $0.visible, opacity: $0.opacity, name: $0.name)
+        let ts = tracks.map { track in
+            TrackState(
+                cels: track.cels.map { cel in
+                    cel.map { Data(bytes: $0.contents(), count: $0.length) }
+                },
+                visible: track.visible, opacity: track.opacity, name: track.name, id: track.id)
         }
-        return DocSnapshot(layers: states, activeLayerIndex: activeLayerIndex, layerCounter: layerCounter)
+        return DocSnapshot(tracks: ts, frameCount: frameCount, currentFrame: currentFrame,
+                           activeTrackIndex: activeTrackIndex, trackCounter: trackCounter,
+                           trackIdSeq: trackIdSeq)
     }
 
-    /// 取り消し可能な操作の直前に呼ぶ。現在状態を undo スタックへ積み、redo を破棄。
     private func checkpoint() {
         undoStack.append(makeSnapshot())
-        if undoStack.count > maxUndoDepth {
-            undoStack.removeFirst(undoStack.count - maxUndoDepth)
-        }
+        if undoStack.count > maxUndoDepth { undoStack.removeFirst(undoStack.count - maxUndoDepth) }
         redoStack.removeAll()
     }
 
-    private func restore(_ snap: DocSnapshot) {
-        layers = snap.layers.map { st in
-            let buf = makeDepositBuffer()! // 0 初期化されるが直後に上書き
-            st.deposit.withUnsafeBytes { raw in
-                memcpy(buf.contents(), raw.baseAddress!, min(buf.length, st.deposit.count))
-            }
-            return Layer(deposit: buf, visible: st.visible, opacity: st.opacity, name: st.name)
+    private func celFromData(_ data: Data?) -> MTLBuffer? {
+        guard let data, let buf = makeDepositBuffer() else { return nil }
+        data.withUnsafeBytes { raw in
+            memcpy(buf.contents(), raw.baseAddress!, min(buf.length, data.count))
         }
-        activeLayerIndex = min(max(snap.activeLayerIndex, 0), layers.count - 1)
-        layerCounter = snap.layerCounter
-        // ウェットは破棄
-        pendingStamps.removeAll()
+        return buf
+    }
+
+    private func restore(_ snap: DocSnapshot) {
+        tracks = snap.tracks.map { st in
+            LayerTrack(cels: st.cels.map { celFromData($0) },
+                       visible: st.visible, opacity: st.opacity, name: st.name, id: st.id)
+        }
+        frameCount = snap.frameCount
+        currentFrame = min(max(snap.currentFrame, 0), frameCount - 1)
+        activeTrackIndex = min(max(snap.activeTrackIndex, 0), tracks.count - 1)
+        trackCounter = snap.trackCounter
+        trackIdSeq = snap.trackIdSeq
+        zeroWet()
         lastStrokeSample = nil
         activeDab = nil
-        for buf in [waterA, waterB, pigmentA, pigmentB] { memset(buf.contents(), 0, buf.length) }
         rebuildComposites()
     }
 
@@ -422,29 +546,39 @@ public final class SimulationEngine {
 
     // MARK: - ドキュメント保存/読み込み(.bloom バイナリ)
     //
-    // 書式(リトルエンディアン): magic "BLM1" / version u32 / width u32 / height u32 /
-    //   layerCount u32 / activeIndex u32 / layerCounter u32 /
-    //   各層 { nameByteCount u32, name UTF8, visible u8, opacity f32, deposit raw(w*h*16) }
-    // ウェット(W/P)と紙テクスチャは保存しない(前者は一時的、後者は寸法から決定的)。
+    // v2 書式(リトルエンディアン): magic "BLM1" / version(2) / width / height /
+    //   frameCount / trackCount / activeTrack / currentFrame / trackCounter /
+    //   各トラック { nameLen, name, visible u8, opacity f32,
+    //     各フレーム { hasCel u8, [deposit raw(w*h*16) if hasCel] } }
+    // v1(version 1)は単一フレーム・各レイヤー1セルとして後方互換で読む。
 
     private static let docMagic: [UInt8] = [0x42, 0x4C, 0x4D, 0x31] // "BLM1"
 
     public func saveDocument(to url: URL) throws {
         var data = Data()
         data.append(contentsOf: Self.docMagic)
-        appendU32(1, &data) // version
+        appendU32(2, &data) // version
         appendU32(UInt32(gridWidth), &data)
         appendU32(UInt32(gridHeight), &data)
-        appendU32(UInt32(layers.count), &data)
-        appendU32(UInt32(activeLayerIndex), &data)
-        appendU32(UInt32(layerCounter), &data)
-        for layer in layers {
-            let nameBytes = Array(layer.name.utf8)
+        appendU32(UInt32(frameCount), &data)
+        appendU32(UInt32(tracks.count), &data)
+        appendU32(UInt32(activeTrackIndex), &data)
+        appendU32(UInt32(currentFrame), &data)
+        appendU32(UInt32(trackCounter), &data)
+        for track in tracks {
+            let nameBytes = Array(track.name.utf8)
             appendU32(UInt32(nameBytes.count), &data)
             data.append(contentsOf: nameBytes)
-            data.append(layer.visible ? 1 : 0)
-            appendU32(layer.opacity.bitPattern, &data)
-            data.append(Data(bytes: layer.deposit.contents(), count: layer.deposit.length))
+            data.append(track.visible ? 1 : 0)
+            appendU32(track.opacity.bitPattern, &data)
+            for cel in track.cels {
+                if let cel {
+                    data.append(1)
+                    data.append(Data(bytes: cel.contents(), count: cel.length))
+                } else {
+                    data.append(0)
+                }
+            }
         }
         try data.write(to: url, options: .atomic)
     }
@@ -459,46 +593,92 @@ public final class SimulationEngine {
             return UInt32(bytes[c]) | UInt32(bytes[c+1]) << 8
                  | UInt32(bytes[c+2]) << 16 | UInt32(bytes[c+3]) << 24
         }
-
-        guard bytes.count >= 4, Array(bytes[0..<4]) == Self.docMagic else {
-            throw fail("Bloom ドキュメントではありません")
-        }
-        c = 4
-        guard try readU32() == 1 else { throw fail("対応していないバージョンです") }
-        let w = Int(try readU32()), h = Int(try readU32())
-        guard w == gridWidth, h == gridHeight else {
-            throw fail("キャンバスサイズが一致しません(\(w)x\(h) vs \(gridWidth)x\(gridHeight))")
-        }
-        let count = Int(try readU32())
-        let active = Int(try readU32())
-        let counter = Int(try readU32())
-        let depositBytes = gridWidth * gridHeight * MemoryLayout<SIMD3<Float>>.stride
-
-        var newLayers: [Layer] = []
-        for _ in 0..<count {
-            let nameLen = Int(try readU32())
-            guard c + nameLen <= bytes.count else { throw fail("ファイルが途中で切れています") }
-            let name = String(decoding: bytes[c..<c+nameLen], as: UTF8.self); c += nameLen
+        func readU8() throws -> UInt8 {
             guard c + 1 <= bytes.count else { throw fail("ファイルが途中で切れています") }
-            let visible = bytes[c] != 0; c += 1
-            let opacity = Float(bitPattern: try readU32())
+            defer { c += 1 }
+            return bytes[c]
+        }
+        let depositBytes = gridWidth * gridHeight * MemoryLayout<SIMD3<Float>>.stride
+        func readCel(present: Bool) throws -> MTLBuffer? {
+            guard present else { return nil }
             guard c + depositBytes <= bytes.count else { throw fail("レイヤーデータが不足しています") }
             guard let buf = makeDepositBuffer() else { throw fail("バッファ確保に失敗") }
             bytes.withUnsafeBytes { raw in
                 memcpy(buf.contents(), raw.baseAddress!.advanced(by: c), depositBytes)
             }
             c += depositBytes
-            newLayers.append(Layer(deposit: buf, visible: visible, opacity: opacity, name: name))
+            return buf
         }
-        guard !newLayers.isEmpty else { throw fail("レイヤーがありません") }
 
-        layers = newLayers
-        activeLayerIndex = min(max(active, 0), layers.count - 1)
-        layerCounter = max(counter, layers.count)
-        // 読み込みは新しいドキュメント。履歴とウェットはリセット
+        guard bytes.count >= 4, Array(bytes[0..<4]) == Self.docMagic else {
+            throw fail("Bloom ドキュメントではありません")
+        }
+        c = 4
+        let version = try readU32()
+        guard version == 1 || version == 2 else { throw fail("対応していないバージョンです") }
+        let w = Int(try readU32()), h = Int(try readU32())
+        guard w == gridWidth, h == gridHeight else {
+            throw fail("キャンバスサイズが一致しません(\(w)x\(h) vs \(gridWidth)x\(gridHeight))")
+        }
+
+        var newTracks: [LayerTrack] = []
+        var newFrameCount = 1
+        var newActiveTrack = 0
+        var newCurrentFrame = 0
+        var newTrackCounter = 0
+        var idSeq = 0
+
+        if version == 1 {
+            // v1: layerCount / activeIndex / layerCounter / 各層 { name, visible, opacity, deposit }
+            let count = Int(try readU32())
+            newActiveTrack = Int(try readU32())
+            newTrackCounter = Int(try readU32())
+            for _ in 0..<count {
+                let nameLen = Int(try readU32())
+                guard c + nameLen <= bytes.count else { throw fail("ファイルが途中で切れています") }
+                let name = String(decoding: bytes[c..<c+nameLen], as: UTF8.self); c += nameLen
+                let visible = try readU8() != 0
+                let opacity = Float(bitPattern: try readU32())
+                let cel = try readCel(present: true)
+                idSeq += 1
+                newTracks.append(LayerTrack(cels: [cel], visible: visible, opacity: opacity,
+                                            name: name, id: idSeq))
+            }
+        } else {
+            // v2
+            newFrameCount = Int(try readU32())
+            let trackCount = Int(try readU32())
+            newActiveTrack = Int(try readU32())
+            newCurrentFrame = Int(try readU32())
+            newTrackCounter = Int(try readU32())
+            guard newFrameCount >= 1 else { throw fail("フレーム数が不正です") }
+            for _ in 0..<trackCount {
+                let nameLen = Int(try readU32())
+                guard c + nameLen <= bytes.count else { throw fail("ファイルが途中で切れています") }
+                let name = String(decoding: bytes[c..<c+nameLen], as: UTF8.self); c += nameLen
+                let visible = try readU8() != 0
+                let opacity = Float(bitPattern: try readU32())
+                var cels: [MTLBuffer?] = []
+                for _ in 0..<newFrameCount {
+                    let present = try readU8() != 0
+                    cels.append(try readCel(present: present))
+                }
+                idSeq += 1
+                newTracks.append(LayerTrack(cels: cels, visible: visible, opacity: opacity,
+                                            name: name, id: idSeq))
+            }
+        }
+        guard !newTracks.isEmpty else { throw fail("レイヤーがありません") }
+
+        tracks = newTracks
+        frameCount = newFrameCount
+        currentFrame = min(max(newCurrentFrame, 0), frameCount - 1)
+        activeTrackIndex = min(max(newActiveTrack, 0), tracks.count - 1)
+        trackCounter = max(newTrackCounter, tracks.count)
+        trackIdSeq = idSeq
+        // 新しいドキュメント: 履歴とウェットをリセット
         undoStack.removeAll(); redoStack.removeAll()
-        pendingStamps.removeAll(); lastStrokeSample = nil; activeDab = nil
-        for b in [waterA, waterB, pigmentA, pigmentB] { memset(b.contents(), 0, b.length) }
+        zeroWet(); lastStrokeSample = nil; activeDab = nil
         rebuildComposites()
     }
 
@@ -507,10 +687,11 @@ public final class SimulationEngine {
         data.append(UInt8((v >> 16) & 0xff)); data.append(UInt8((v >> 24) & 0xff))
     }
 
-    /// 可視レイヤーを下/上のアフィン変換 (A,B) へ畳み込む(レイヤー操作時のみ・低頻度)。
+    // MARK: - 合成・描画
+
+    /// 可視トラックを現フレームの解決後セルに直し、下/上のアフィン変換 (A,B) へ畳み込む。
     /// アクティブ層は毎フレーム変わるので render 時に別途合成する。
     private func rebuildComposites() {
-        // A は単位元 1、B は 0 で初期化
         let n = gridWidth * gridHeight
         for buf in [belowA, aboveA] {
             let p = buf.contents().bindMemory(to: SIMD3<Float>.self, capacity: n)
@@ -525,19 +706,50 @@ public final class SimulationEngine {
         enc.setComputePipelineState(compositePipeline)
 
         func fold(accA: MTLBuffer, accB: MTLBuffer, indices: Range<Int>) {
-            for idx in indices where layers[idx].visible {
-                var op = layers[idx].opacity
+            for idx in indices where tracks[idx].visible {
+                guard let cel = resolvedCel(idx, currentFrame) else { continue }
+                var op = tracks[idx].opacity
                 enc.setBuffer(accA, offset: 0, index: 0)
                 enc.setBuffer(accB, offset: 0, index: 1)
-                enc.setBuffer(layers[idx].deposit, offset: 0, index: 2)
+                enc.setBuffer(cel, offset: 0, index: 2)
                 enc.setBytes(&op, length: MemoryLayout<Float>.stride, index: 3)
                 enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 4)
                 enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
-                enc.memoryBarrier(scope: .buffers) // 同一バッファへの逐次合成を順序保証
+                enc.memoryBarrier(scope: .buffers)
             }
         }
-        fold(accA: belowA, accB: belowB, indices: 0..<activeLayerIndex)              // 下層(bottom→top)
-        fold(accA: aboveA, accB: aboveB, indices: (activeLayerIndex + 1)..<layers.count) // 上層
+        fold(accA: belowA, accB: belowB, indices: 0..<activeTrackIndex)
+        fold(accA: aboveA, accB: aboveB, indices: (activeTrackIndex + 1)..<tracks.count)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        rebuildOnion()
+    }
+
+    /// オニオン: 前フレームの全可視トラックを畳み込む(無効/先頭フレームは identity=白)
+    private func rebuildOnion() {
+        let n = gridWidth * gridHeight
+        let pa = onionA.contents().bindMemory(to: SIMD3<Float>.self, capacity: n)
+        for i in 0..<n { pa[i] = SIMD3(repeating: 1) }
+        memset(onionB.contents(), 0, onionB.length)
+        guard onionEnabled, currentFrame > 0 else { return }
+        let prev = currentFrame - 1
+        guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return }
+        let grid = MTLSize(width: gridWidth, height: gridHeight, depth: 1)
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        enc.setComputePipelineState(compositePipeline)
+        for idx in tracks.indices where tracks[idx].visible {
+            guard let cel = resolvedCel(idx, prev) else { continue }
+            var op = tracks[idx].opacity
+            enc.setBuffer(onionA, offset: 0, index: 0)
+            enc.setBuffer(onionB, offset: 0, index: 1)
+            enc.setBuffer(cel, offset: 0, index: 2)
+            enc.setBytes(&op, length: MemoryLayout<Float>.stride, index: 3)
+            enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 4)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+            enc.memoryBarrier(scope: .buffers)
+        }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -549,7 +761,7 @@ public final class SimulationEngine {
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         let grid = MTLSize(width: gridWidth, height: gridHeight, depth: 1)
 
-        emitDwellStamp() // 筆を下ろしている間は止めていても継ぎ足す
+        emitDwellStamp()
 
         // 1. スタンプ
         if !pendingStamps.isEmpty {
@@ -566,13 +778,14 @@ public final class SimulationEngine {
             enc.setBuffer(pigmentA, offset: 0, index: 1)
             enc.setBuffer(stampBuffer, offset: 0, index: 2)
             enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 3)
-            enc.setBuffer(paper, offset: 0, index: 4) // ドライブラシのかすれマスク用
+            enc.setBuffer(paper, offset: 0, index: 4)
             enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
             pendingStamps.removeFirst(count)
         }
         params.stampCount = 0
 
-        // 2. 水流 + 乾燥(substep)
+        // 2. 水流 + 乾燥(substep)。乾燥沈着はアクティブセル(描画ターゲット)へ。
+        let target = dryTarget
         for _ in 0..<substepsPerFrame {
             enc.setComputePipelineState(flowPipeline)
             enc.setBuffer(waterA, offset: 0, index: 0)
@@ -588,15 +801,21 @@ public final class SimulationEngine {
             enc.setComputePipelineState(dryPipeline)
             enc.setBuffer(waterA, offset: 0, index: 0)
             enc.setBuffer(pigmentA, offset: 0, index: 1)
-            enc.setBuffer(activeDeposit, offset: 0, index: 2) // 乾燥沈着はアクティブ層へ
+            enc.setBuffer(target, offset: 0, index: 2)
             enc.setBuffer(paper, offset: 0, index: 3)
             enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 4)
             enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
         }
 
-        // 3. 表示(下 → アクティブ → 上 の順で over 合成)
-        params.activeFactor = layers[activeLayerIndex].visible ? 1.0 : 0.0
-        params.activeOpacity = layers[activeLayerIndex].opacity
+        encodeRender(into: texture, encoder: enc, tg: tg)
+        enc.endEncoding()
+    }
+
+    /// 現フレームの合成を texture に描く(render パイプラインのバインドを共通化)
+    private func encodeRender(into texture: MTLTexture, encoder enc: MTLComputeCommandEncoder, tg: MTLSize) {
+        params.activeFactor = activeHasVisibleCel ? 1.0 : 0.0
+        params.activeOpacity = tracks[activeTrackIndex].opacity
+        params.onionFactor = (onionEnabled && currentFrame > 0) ? onionStrength : 0
         enc.setComputePipelineState(renderPipeline)
         enc.setTexture(texture, index: 0)
         enc.setBuffer(waterA, offset: 0, index: 0)
@@ -605,14 +824,15 @@ public final class SimulationEngine {
         enc.setBuffer(belowB, offset: 0, index: 3)
         enc.setBuffer(aboveA, offset: 0, index: 4)
         enc.setBuffer(aboveB, offset: 0, index: 5)
-        enc.setBuffer(activeDeposit, offset: 0, index: 6)
+        enc.setBuffer(activeDisplayCel, offset: 0, index: 6)
         enc.setBuffer(paper, offset: 0, index: 7)
         enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
+        enc.setBuffer(onionA, offset: 0, index: 9)
+        enc.setBuffer(onionB, offset: 0, index: 10)
         enc.dispatchThreads(
             MTLSize(width: texture.width, height: texture.height, depth: 1),
             threadsPerThreadgroup: tg
         )
-        enc.endEncoding()
     }
 
     public func makeCommandBuffer() -> MTLCommandBuffer? {
@@ -621,10 +841,10 @@ public final class SimulationEngine {
 
     public var metalDevice: MTLDevice { device }
 
-    // MARK: - スナップショット(自動検証用)
+    // MARK: - 画像化
 
-    /// 現在のキャンバスをグリッド等倍で PNG に書き出す。
-    public func savePNG(to url: URL) throws {
+    /// 現フレームの合成をグリッド等倍の CGImage にする(PNG/GIF/スプライト書き出しで再利用)
+    internal func renderFrameCGImage() throws -> CGImage {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: gridWidth, height: gridHeight, mipmapped: false
         )
@@ -635,25 +855,7 @@ public final class SimulationEngine {
               let enc = cb.makeComputeCommandEncoder() else {
             throw EngineError.pipelineFailed("snapshot texture")
         }
-        enc.setComputePipelineState(renderPipeline)
-        enc.setTexture(tex, index: 0)
-        enc.setBuffer(waterA, offset: 0, index: 0)
-        enc.setBuffer(pigmentA, offset: 0, index: 1)
-        enc.setBuffer(belowA, offset: 0, index: 2)
-        enc.setBuffer(belowB, offset: 0, index: 3)
-        enc.setBuffer(aboveA, offset: 0, index: 4)
-        enc.setBuffer(aboveB, offset: 0, index: 5)
-        enc.setBuffer(activeDeposit, offset: 0, index: 6)
-        enc.setBuffer(paper, offset: 0, index: 7)
-        var prm = params
-        prm.stampCount = 0
-        prm.activeFactor = layers[activeLayerIndex].visible ? 1.0 : 0.0
-        prm.activeOpacity = layers[activeLayerIndex].opacity
-        enc.setBytes(&prm, length: MemoryLayout<SimParams>.stride, index: 8)
-        enc.dispatchThreads(
-            MTLSize(width: gridWidth, height: gridHeight, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
-        )
+        encodeRender(into: tex, encoder: enc, tg: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -676,14 +878,18 @@ public final class SimulationEngine {
             ) else { return nil }
             return ctx.makeImage()
         }
-        guard let cgImage,
-              let dest = CGImageDestinationCreateWithURL(
-                url as CFURL, UTType.png.identifier as CFString, 1, nil
-              ) else {
-            throw EngineError.pipelineFailed("png export")
-        }
+        guard let cgImage else { throw EngineError.pipelineFailed("cgimage") }
+        return cgImage
+    }
+
+    /// 現フレームをグリッド等倍で PNG に書き出す。
+    public func savePNG(to url: URL) throws {
+        let cgImage = try renderFrameCGImage()
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil
+        ) else { throw EngineError.pipelineFailed("png export") }
         CGImageDestinationAddImage(dest, cgImage, nil)
-        CGImageDestinationFinalize(dest)
+        guard CGImageDestinationFinalize(dest) else { throw EngineError.pipelineFailed("png finalize") }
     }
 
     // MARK: - 内部
