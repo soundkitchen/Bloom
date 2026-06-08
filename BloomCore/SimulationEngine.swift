@@ -127,7 +127,7 @@ public final class SimulationEngine {
     private let dwellWaterRate: Float = 0.08
     private let dwellPigmentRate: Float = 0.018
 
-    public enum EngineError: Error { case noDevice, pipelineFailed(String) }
+    public enum EngineError: Error { case noDevice, pipelineFailed(String), documentFormat(String) }
 
     public init(width: Int, height: Int) throws {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -418,6 +418,93 @@ public final class SimulationEngine {
         guard canRedo else { return }
         undoStack.append(makeSnapshot())
         restore(redoStack.removeLast())
+    }
+
+    // MARK: - ドキュメント保存/読み込み(.bloom バイナリ)
+    //
+    // 書式(リトルエンディアン): magic "BLM1" / version u32 / width u32 / height u32 /
+    //   layerCount u32 / activeIndex u32 / layerCounter u32 /
+    //   各層 { nameByteCount u32, name UTF8, visible u8, opacity f32, deposit raw(w*h*16) }
+    // ウェット(W/P)と紙テクスチャは保存しない(前者は一時的、後者は寸法から決定的)。
+
+    private static let docMagic: [UInt8] = [0x42, 0x4C, 0x4D, 0x31] // "BLM1"
+
+    public func saveDocument(to url: URL) throws {
+        var data = Data()
+        data.append(contentsOf: Self.docMagic)
+        appendU32(1, &data) // version
+        appendU32(UInt32(gridWidth), &data)
+        appendU32(UInt32(gridHeight), &data)
+        appendU32(UInt32(layers.count), &data)
+        appendU32(UInt32(activeLayerIndex), &data)
+        appendU32(UInt32(layerCounter), &data)
+        for layer in layers {
+            let nameBytes = Array(layer.name.utf8)
+            appendU32(UInt32(nameBytes.count), &data)
+            data.append(contentsOf: nameBytes)
+            data.append(layer.visible ? 1 : 0)
+            appendU32(layer.opacity.bitPattern, &data)
+            data.append(Data(bytes: layer.deposit.contents(), count: layer.deposit.length))
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
+    public func loadDocument(from url: URL) throws {
+        let bytes = [UInt8](try Data(contentsOf: url))
+        var c = 0
+        func fail(_ m: String) -> EngineError { .documentFormat(m) }
+        func readU32() throws -> UInt32 {
+            guard c + 4 <= bytes.count else { throw fail("ファイルが途中で切れています") }
+            defer { c += 4 }
+            return UInt32(bytes[c]) | UInt32(bytes[c+1]) << 8
+                 | UInt32(bytes[c+2]) << 16 | UInt32(bytes[c+3]) << 24
+        }
+
+        guard bytes.count >= 4, Array(bytes[0..<4]) == Self.docMagic else {
+            throw fail("Bloom ドキュメントではありません")
+        }
+        c = 4
+        guard try readU32() == 1 else { throw fail("対応していないバージョンです") }
+        let w = Int(try readU32()), h = Int(try readU32())
+        guard w == gridWidth, h == gridHeight else {
+            throw fail("キャンバスサイズが一致しません(\(w)x\(h) vs \(gridWidth)x\(gridHeight))")
+        }
+        let count = Int(try readU32())
+        let active = Int(try readU32())
+        let counter = Int(try readU32())
+        let depositBytes = gridWidth * gridHeight * MemoryLayout<SIMD3<Float>>.stride
+
+        var newLayers: [Layer] = []
+        for _ in 0..<count {
+            let nameLen = Int(try readU32())
+            guard c + nameLen <= bytes.count else { throw fail("ファイルが途中で切れています") }
+            let name = String(decoding: bytes[c..<c+nameLen], as: UTF8.self); c += nameLen
+            guard c + 1 <= bytes.count else { throw fail("ファイルが途中で切れています") }
+            let visible = bytes[c] != 0; c += 1
+            let opacity = Float(bitPattern: try readU32())
+            guard c + depositBytes <= bytes.count else { throw fail("レイヤーデータが不足しています") }
+            guard let buf = makeDepositBuffer() else { throw fail("バッファ確保に失敗") }
+            bytes.withUnsafeBytes { raw in
+                memcpy(buf.contents(), raw.baseAddress!.advanced(by: c), depositBytes)
+            }
+            c += depositBytes
+            newLayers.append(Layer(deposit: buf, visible: visible, opacity: opacity, name: name))
+        }
+        guard !newLayers.isEmpty else { throw fail("レイヤーがありません") }
+
+        layers = newLayers
+        activeLayerIndex = min(max(active, 0), layers.count - 1)
+        layerCounter = max(counter, layers.count)
+        // 読み込みは新しいドキュメント。履歴とウェットはリセット
+        undoStack.removeAll(); redoStack.removeAll()
+        pendingStamps.removeAll(); lastStrokeSample = nil; activeDab = nil
+        for b in [waterA, waterB, pigmentA, pigmentB] { memset(b.contents(), 0, b.length) }
+        rebuildComposites()
+    }
+
+    private func appendU32(_ v: UInt32, _ data: inout Data) {
+        data.append(UInt8(v & 0xff)); data.append(UInt8((v >> 8) & 0xff))
+        data.append(UInt8((v >> 16) & 0xff)); data.append(UInt8((v >> 24) & 0xff))
     }
 
     /// 可視レイヤーを下/上のアフィン変換 (A,B) へ畳み込む(レイヤー操作時のみ・低頻度)。
