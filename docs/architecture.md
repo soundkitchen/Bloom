@@ -44,7 +44,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 |---|---|---|---|
 | `W` | float | 水量 | 毎 substep |
 | `P` | float3 | 浮遊顔料(水に乗って動く)。RGB 各チャンネルの吸光度 | 毎 substep |
-| `D` | float3 | 沈着顔料(乾いた絵そのもの)。レイヤーごとに 1 枚 | 蒸発時に増える |
+| `D` | float3 | 沈着顔料(乾いた絵そのもの)。= トラックのフレームごとのセル | 蒸発時に増える |
 | `H` | float | 紙の凹凸(2 オクターブ値ノイズ) | 静的 |
 
 顔料は **RGB 吸光度**(float3)。ブラシの色は `K = -ln(color)` で吸光度に変換してスタンプ時に積む。異なる色が重なると吸光度が加算される = **減法混色**。流れ方・乾き方はチャンネル共通の物理に乗る。
@@ -55,7 +55,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - **stampKernel** — ブラシスタンプ。筆圧が半径と水・顔料量に効く。四次フォールオフ。`dryness` が高いと紙の凸部(H 高)にだけ顔料が乗る = **かすれ**(ドライブラシ)
 - **flowKernel** — 水頭 `W + paperInfluence·H` の隣接差分で水が移動し、顔料を運ぶ。乾いたセル(`W ≤ wetThreshold`)からは流れない = ピン留めで硬いエッジができる。対称な流量制限(`min(f, w·0.2)`)で質量保存。W/P はピンポンバッファ
 - **dryKernel** — 蒸発。濡れた隣接セルが少ない「縁」ほど速く乾く(`edgeEvapBoost`)→ エッジダークニングの源。失われた水の割合に応じて P → D へ沈着し、紙の谷(H 低)ほど多く沈着(`granulation`)
-- **renderKernel** — 紙を底に、下層 → アクティブ層(`D` + ウェット `P`)→ 上層 のアフィングレーズ変換を順に適用(下の「レイヤー」節)。バイリニア補間で drawable 解像度へ
+- **renderKernel** — 紙を底に、下層 → アクティブ層(`D` + ウェット `P`)→ 上層 のアフィングレーズ変換を順に適用(下の「レイヤー / タイムライン」節)。オニオン有効時は前フレームを薄く重ねる。バイリニア補間で drawable 解像度へ
 
 ### ブラシプリセット(SimulationEngine.Brush)
 
@@ -85,7 +85,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
   - 薄い顔料(`occ≈0`)→ `r→T·r` の純粋な乗算フィルタ = 全力で色を付けつつ下が透ける(水彩らしさ、ほぼ順序非依存)
   - 濃い顔料(`occ≈1`)→ `r→T` で下を自分の色に置き換える(不透明、**順序が効く**)
 - アフィン変換は合成できるので、アクティブ層より下/上の可視層を **(A, B) 各 float3 へ畳み込む**(`belowA/belowB` `aboveA/aboveB`)。render は 紙 → 下層変換 → アクティブ層(+ウェット) → 上層変換 の順に適用
-- 畳み込みは `compositeLayerKernel` を下→上に逐次 dispatch(同一バッファへ書くので `memoryBarrier` で順序保証)。レイヤー操作時のみ再構築(低頻度)
+- 畳み込みは `compositeLayerKernel` を下→上に逐次 dispatch(同一バッファへ書くので `memoryBarrier` で順序保証)。レイヤー/フレーム操作時のみ再構築(低頻度)
 - 操作 API: `addLayer` / `deleteLayer(row:)` / `setActiveLayer(row:)` / `toggleLayerVisible(row:)` / `setLayerOpacity(row:opacity:)` / `moveLayer(fromRow:toRow:)`。UI の行は上が手前(`layerInfos` は内部配列の逆順)。`moveLayer` はアクティブトラックを安定 `id` で追従させる
 
 ### 書き出し(`AnimationExport`)

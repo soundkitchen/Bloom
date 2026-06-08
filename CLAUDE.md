@@ -23,17 +23,21 @@ make run    # アプリ起動
 make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dry PNG を出力
 ```
 
-検証モード(キャンバス全面・自動スナップショット):
-- `BloomApp --demo --snapshot-dir <dir>` … wet.png / dry.png
-- `BloomApp --demo-dwell --snapshot-dir <dir>` … 置きっぱなしの溜まり(320px キャンバス)
-- `BloomApp --demo-layers --snapshot-dir <dir>` … レイヤー合成・順序・表示切替
+検証モード(キャンバス全面・自動スナップショット。`--snapshot-dir <dir>` 付き):
+- `--demo` … wet.png / dry.png
+- `--demo-dwell` … 置きっぱなしの溜まり(320px キャンバス)
+- `--demo-layers` … レイヤー合成・順序・表示切替
+- `--demo-undo` … ストロークの取り消し
+- `--demo-saveload` … `.bloom` 保存→消去→読込で復元
+- `--demo-anim` … 数フレーム → GIF / スプライトシート / PNG 連番
+- `--demo-onion` … オニオンスキン(前フレームのゴースト)
 
 描き味やレンダリングの変更は、この PNG スナップショットを目視で確認しながら詰める。
 
 ## 構成
 
-- `BloomCore/`(framework・AppKit 非依存) … 描画コア。`SimulationEngine`(滲みシミュレーション + 合成)、`Simulation.metal`(GPU カーネル)、`InputSample`(入力抽象 + 擬似筆圧)
-- `BloomApp/`(app・AppKit + MetalKit) … `CanvasView`(入力 → コア API)、`InspectorView`(ブラシ/色/レイヤー UI)、`AppDelegate`
+- `BloomCore/`(framework・AppKit 非依存) … 描画コア。`SimulationEngine`(滲みシミュレーション + レイヤー/フレーム + 合成)、`Simulation.metal`(GPU カーネル)、`AnimationExport`(GIF/スプライト/連番)、`InputSample`(入力抽象 + 擬似筆圧)
+- `BloomApp/`(app・AppKit + MetalKit) … `CanvasView`(入力 → コア API)、`InspectorView`(ブラシ/色/レイヤー)、`TimelineView`(フレーム/再生/オニオン)、`AppDelegate`(ウィンドウ・メニュー・再生)
 - `BloomCoreTests/` … ユニットテスト
 - `docs/` … `idea.md`(構想)、`architecture.md`(コードの現在形)、`devlog/`(日付つき経緯)、`images/`
 
