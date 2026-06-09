@@ -11,3 +11,6 @@ xcuserdata/
 
 # XcodeGen が生成する Info.plist
 BloomApp/Info.plist
+
+# 一時ファイル置き場(git 管理外)
+tmp/
