@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
 
         let args = CommandLine.arguments
-        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion", "--demo-stabilize", "--demo-sumi"]
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion", "--demo-stabilize", "--demo-sumi", "--demo-guide"]
         if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
@@ -230,6 +230,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--demo-sumi") {
             runSumiDemo(snapshotDir: snapshotDir)
+            return
+        }
+        if args.contains("--demo-guide") {
+            runGuideDemo(snapshotDir: snapshotDir)
             return
         }
 
@@ -535,6 +539,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             try? engine.savePNG(to: dir.appendingPathComponent("sumi.png"))
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// 使い方ガイド用の作例(--demo-guide): 水彩のウォッシュ(空+地)→ 乾燥 → 墨レイヤーで
+    /// かすれたアクセント(草・枝の払い)を重ねる。水彩のみ段階で guide-watercolor.png、
+    /// 完成で guide-hero.png を出す。複数機能(滲み・色・レイヤー・かすれ)を 1 枚で見せる。
+    private func runGuideDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+
+        func wash(color: SIMD3<Float>, radius: Float, baseY: Float, amp: Float, pressure: Float) {
+            var b = SimulationEngine.Brush.watercolor
+            b.color = color
+            b.baseRadius = radius
+            engine.brush = b
+            engine.beginStroke()
+            for i in 0..<110 {
+                let t = Float(i) / 109
+                engine.addStrokeSample(
+                    at: SIMD2(0.08 * w + 0.84 * w * t, baseY + amp * sin(t * .pi * 1.3)),
+                    pressure: pressure)
+            }
+            engine.endStroke()
+        }
+        // 墨の葦(reed): 下から上へ立ち上がり、穂先へ向けて筆圧が抜けてかすれる。bow で横に弓なり。
+        func sumiReed(baseX: Float, baseY: Float, tipX: Float, tipY: Float, p0: Float, p1: Float, bow: Float) {
+            engine.brush = .sumi
+            engine.beginStroke()
+            for i in 0..<56 {
+                let t = Float(i) / 55
+                engine.addStrokeSample(
+                    at: SIMD2(baseX + (tipX - baseX) * t + bow * sin(t * .pi),
+                              baseY + (tipY - baseY) * t),
+                    pressure: p0 + (p1 - p0) * t)
+            }
+            engine.endStroke()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            wash(color: SIMD3(0.32, 0.46, 0.66), radius: 36, baseY: 0.38 * h, amp: 0.05 * h, pressure: 0.55) // 空
+            wash(color: SIMD3(0.58, 0.49, 0.32), radius: 26, baseY: 0.70 * h, amp: 0.03 * h, pressure: 0.40) // 岸(薄め)
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // 水彩が十分乾いてから保存 + 墨レイヤーへ。乾く前に層を切り替えると残りの濡れ顔料が
+        // 墨レイヤーに沈着する(§5 の意味論どおりだが作例としては不要)ので余裕を取る。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
+            try? engine.savePNG(to: dir.appendingPathComponent("guide-watercolor.png")) // 水彩のみ(乾いた)
+            engine.addLayer() // 墨は上のレイヤーへ
+            // 岸から立ち上がる葦を数本。穂先へ向けて低圧=かすれ。横位置を散らし、弓なりに。
+            sumiReed(baseX: 0.30 * w, baseY: 0.78 * h, tipX: 0.27 * w, tipY: 0.34 * h, p0: 0.85, p1: 0.05, bow: -0.015 * w)
+            sumiReed(baseX: 0.37 * w, baseY: 0.80 * h, tipX: 0.39 * w, tipY: 0.40 * h, p0: 0.80, p1: 0.05, bow:  0.020 * w)
+            sumiReed(baseX: 0.44 * w, baseY: 0.79 * h, tipX: 0.41 * w, tipY: 0.44 * h, p0: 0.75, p1: 0.06, bow: -0.012 * w)
+            // 穂(葉)を 2 つ、軽く速い払いで
+            sumiReed(baseX: 0.30 * w, baseY: 0.46 * h, tipX: 0.24 * w, tipY: 0.40 * h, p0: 0.35, p1: 0.04, bow: 0.0)
+            sumiReed(baseX: 0.39 * w, baseY: 0.50 * h, tipX: 0.45 * w, tipY: 0.45 * h, p0: 0.32, p1: 0.04, bow: 0.0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12.5) {
+            try? engine.savePNG(to: dir.appendingPathComponent("guide-hero.png")) // 完成
             NSApp.terminate(nil)
         }
     }
