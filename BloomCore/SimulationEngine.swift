@@ -905,10 +905,12 @@ public final class SimulationEngine {
     /// 水彩(dryness 0)はウェットのまま触らない。筆圧が抜けるほど実効 dryness を 1 へ寄せる
     /// (入り・抜き・速いマウス払いでかすれる。マウスは擬似筆圧が速度→筆圧に変換済み)。
     /// 水量スライダを上げると水で埋まってかすれが減る。
+    /// 加算幅は dryness 非依存の一定幅(0.30)にして clamp で抑える。`(1-dryness)` で
+    /// 重み付けすると既に乾いた筆(.sumi=0.85)で頭打ちになり、筆圧のレバーがほぼ効かないため。
     private func effectiveDryness(pressure: Float) -> Float {
         let d = brush.dryness
         guard d > 0 else { return 0 }
-        let lighten = (1 - d) * (1 - pressure) * 0.6     // 軽いタッチでかすれを足す
+        let lighten = (1 - pressure) * 0.30              // 軽いタッチでかすれを足す(一定幅)
         let wetFill = max(0, brush.water - 0.15) * 0.6   // 水を増やすと埋まる
         return simd_clamp(d + lighten - wetFill, 0, 1)
     }

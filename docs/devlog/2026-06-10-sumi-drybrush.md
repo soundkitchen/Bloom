@@ -22,10 +22,14 @@ idea.md の「かすれは筆圧・速度・水分量で変化する」に沿っ
 `SimulationEngine.effectiveDryness(pressure:)` を追加し、筆圧が抜けるほど実効 dryness を 1 へ寄せる。乾いた筆(`dryness > 0`)にだけ効かせ、水彩(`dryness 0`)はウェットのまま一切触らない。
 
 ```
-lighten = (1 - dryness) × (1 - pressure) × 0.6   // 軽いタッチでかすれを足す
-wetFill = max(0, water - 0.15) × 0.6             // 水を増やすと埋まる
+lighten = (1 - pressure) × 0.30      // 軽いタッチでかすれを足す(dryness 非依存の一定幅)
+wetFill = max(0, water - 0.15) × 0.6 // 水を増やすと埋まる
 effDryness = clamp(dryness + lighten - wetFill, 0, 1)
 ```
+
+> 加算幅を `(1-dryness)` で重み付けすると、既に乾いた `.sumi`(dryness 0.85)では
+> `(1-0.85)=0.15` で頭打ちになり実効 dryness が 0.85〜0.94 しか動かない(レビュー指摘)。
+> 一定幅 0.30 + clamp にして 0.85→1.0 まで動かし、低圧で floor が消えて白く割れるようにした。
 
 - **速度→かすれは「ただ」で付く**: マウスは `PseudoPressureEstimator` が速度→筆圧に変換済み(速い=軽い)。だから筆圧を唯一のレバーにすると、マウスの速い払いでも自然にかすれる。スタビライザの時と同じく **dt 依存を持ち込まない**設計に揃えた(速度を直接測ると入力レートの揺れに弱い)。
 - **入り・抜きが自然にかすれる**: ストロークの入り・抜きで筆圧が細るので、両端が勝手にかすれる。
@@ -70,5 +74,3 @@ coverage = fall * mix(1.0, grain * streak, dry);        // floor を残し線が
 - ⬜ M4 MCP サーバ / M5 3D 配置
 - ⬜ XPPEN Deco 実測(M0a・タブレット未接続)
 - 「使い方ガイド」(`docs/guide.md`)は M3 が揃ったこのタイミングで着手予定(描き味の核が固まったため)
-</content>
-</invoke>
