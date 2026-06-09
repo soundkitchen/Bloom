@@ -25,6 +25,7 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 
 - **描画**: ドラッグで描く(マウスは速度→擬似筆圧、タブレットは実筆圧)
 - **ブラシ**(右インスペクタ / キー): `1` 水彩(藍) / `2` 墨(かすれ)、カラーウェルで任意色、サイズ `[` `]`、水量スライダ、`c` クリア、`d` デモストローク
+- **手ブレ補正**(インスペクタの「手ブレ」スライダ): 0 でオフ、上げるほど入力の揺れを吸収してなめらかな線になる(ブラシ非依存の入力設定)
 - **レイヤー**(インスペクタの一覧): 目アイコンで表示切替、行の D&D で並べ替え、＋/🗑、不透明スライダ
 - **取り消し / やり直し**: Cmd+Z / Cmd+Shift+Z
 - **アニメーション**(下のタイムライン): フレーム選択・追加/複製/削除、再生 ▶、前後送り、オニオン(前フレームを薄く表示)、fps。フレームメニュー(新規 Cmd+Shift+N など)
@@ -34,6 +35,6 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 
 ## 構成
 
-- `BloomCore/` — ヘッドレスの描画コア(framework、AppKit 非依存)。滲みシミュレーション + レイヤー/フレーム(`SimulationEngine`)、Metal カーネル(`Simulation.metal`)、書き出し(`AnimationExport`)、入力抽象(`InputSample`)
+- `BloomCore/` — ヘッドレスの描画コア(framework、AppKit 非依存)。滲みシミュレーション + レイヤー/フレーム(`SimulationEngine`)、Metal カーネル(`Simulation.metal`)、書き出し(`AnimationExport`)、入力抽象 + 擬似筆圧(`InputSample`)、手ブレ補正(`StrokeStabilizer`)
 - `BloomApp/` — macOS アプリ。`CanvasView` / `InspectorView` / `TimelineView` / `AppDelegate`
 - `BloomCoreTests/` — コアのユニットテスト

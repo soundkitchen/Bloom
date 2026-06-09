@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
 
         let args = CommandLine.arguments
-        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion"]
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion", "--demo-stabilize"]
         if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
@@ -75,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inspector.onSelectBrush = { [weak canvas] in canvas?.selectBrush($0) }
         inspector.onSizeChange = { [weak canvas] in canvas?.setBrushRadius($0) }
         inspector.onWaterChange = { [weak canvas] in canvas?.setBrushWater($0) }
+        inspector.onStabilizeChange = { [weak canvas] in canvas?.setStabilizeStrength($0) }
         inspector.onColorChange = { [weak canvas] in canvas?.setBrushColor($0) }
         inspector.onClear = { [weak canvas] in canvas?.engine?.clear() }
 
@@ -221,6 +222,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--demo-onion") {
             runOnionDemo(snapshotDir: snapshotDir)
+            return
+        }
+        if args.contains("--demo-stabilize") {
+            runStabilizeDemo(snapshotDir: snapshotDir)
             return
         }
 
@@ -453,6 +458,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? engine.savePNG(to: dir.appendingPathComponent("onion-frame2.png"))
             engine.setOnionEnabled(false)
             try? engine.savePNG(to: dir.appendingPathComponent("onion-off.png"))
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// 手ブレ補正検証: 同じ「揺れのある入力」を補正なし → あり で描いて比較する。
+    /// なめらかな水平線に高周波・小振幅のジッタ(手ブレ相当)を法線方向に重ねた点列を、
+    /// 実際の StrokeStabilizer 経路(CanvasView.drawStabilizedStroke)へ流す。
+    private func runStabilizeDemo(snapshotDir: URL?) {
+        guard let canvas = self.canvas, let engine = canvas.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+
+        func jitterLine(baselineY: Float) -> [SIMD2<Float>] {
+            (0..<220).map { i in
+                let t = Float(i) / 219
+                let x = 0.1 * w + 0.8 * w * t
+                let y = baselineY + 22 * sin(t * .pi * 34) // 手ブレ相当の細かい揺れ
+                return SIMD2(x, y)
+            }
+        }
+
+        var ink = SimulationEngine.Brush.sumi // 低水で細く出る墨。形(なめらかさ)が見やすい
+        ink.baseRadius = 10
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            engine.brush = ink
+            canvas.drawStabilizedStroke(points: jitterLine(baselineY: 0.4 * h),
+                                        pressure: 0.9, strength: 0)   // 補正なし
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            try? engine.savePNG(to: dir.appendingPathComponent("stabilize-off.png")) // ガタつく
+            engine.clear()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.9) {
+            engine.brush = ink
+            canvas.drawStabilizedStroke(points: jitterLine(baselineY: 0.4 * h),
+                                        pressure: 0.9, strength: 0.85) // 補正あり(flush で終点到達)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.1) {
+            try? engine.savePNG(to: dir.appendingPathComponent("stabilize-on.png")) // なめらか
             NSApp.terminate(nil)
         }
     }

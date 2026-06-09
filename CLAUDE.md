@@ -47,12 +47,13 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 - `--demo-saveload` … `.bloom` 保存→消去→読込で復元
 - `--demo-anim` … 数フレーム → GIF / スプライトシート / PNG 連番
 - `--demo-onion` … オニオンスキン(前フレームのゴースト)
+- `--demo-stabilize` … 手ブレ補正(同じ揺れた入力を補正なし/あり で描き比べ → stabilize-off.png / stabilize-on.png)
 
 描き味やレンダリングの変更は、この PNG スナップショットを目視で確認しながら詰める。
 
 ## 構成
 
-- `BloomCore/`(framework・AppKit 非依存) … 描画コア。`SimulationEngine`(滲みシミュレーション + レイヤー/フレーム + 合成)、`Simulation.metal`(GPU カーネル)、`AnimationExport`(GIF/スプライト/連番)、`InputSample`(入力抽象 + 擬似筆圧)
+- `BloomCore/`(framework・AppKit 非依存) … 描画コア。`SimulationEngine`(滲みシミュレーション + レイヤー/フレーム + 合成)、`Simulation.metal`(GPU カーネル)、`AnimationExport`(GIF/スプライト/連番)、`InputSample`(入力抽象 + 擬似筆圧)、`StrokeStabilizer`(手ブレ補正)
 - `BloomApp/`(app・AppKit + MetalKit) … `CanvasView`(入力 → コア API)、`InspectorView`(ブラシ/色/レイヤー)、`TimelineView`(フレーム/再生/オニオン)、`AppDelegate`(ウィンドウ・メニュー・再生)
 - `BloomCoreTests/` … ユニットテスト
 - `docs/` … `idea.md`(構想)、`architecture.md`(コードの現在形)、`devlog/`(日付つき経緯)、`images/`

@@ -8,6 +8,10 @@ import BloomCore
 final class CanvasView: MTKView {
     private(set) var engine: SimulationEngine?
     private var pressureEstimator = PseudoPressureEstimator()
+    private var stabilizer = StrokeStabilizer()
+    private var stabilizeStrength: Float = 0    // グローバル入力設定(ブラシ非依存)
+    private var lastRawPoint = SIMD2<Float>(0, 0) // 補正前の直近入力(endStroke の flush 終点)
+    private var lastPressure: Float = 0
 
     /// ステータスバー更新用(ウィンドウタイトルではなく下部バーに出す)
     var onStatus: ((String) -> Void)?
@@ -89,6 +93,8 @@ final class CanvasView: MTKView {
     override func mouseDown(with event: NSEvent) {
         guard !isPlaying else { return } // 再生中は描かない
         pressureEstimator.reset()
+        stabilizer.strength = stabilizeStrength
+        stabilizer.reset(at: gridPoint(from: event))
         engine?.beginStroke()
         addSample(from: event)
     }
@@ -100,6 +106,10 @@ final class CanvasView: MTKView {
 
     override func mouseUp(with event: NSEvent) {
         guard !isPlaying else { return }
+        // プル方式は出力が遅れるので、実終点まで補完してから筆を上げる(線を届かせる)
+        for p in stabilizer.flush(to: lastRawPoint) {
+            engine?.addStrokeSample(at: p, pressure: lastPressure)
+        }
         engine?.endStroke()
     }
 
@@ -145,6 +155,13 @@ final class CanvasView: MTKView {
         updateStatus()
     }
 
+    /// 手ブレ補正の強さ(0...1)。ブラシ非依存のグローバル入力設定(インスペクタのスライダから)。
+    /// 進行中のストロークにも即時反映する(StrokeStabilizer は実行中の強度変更に対して安全)。
+    func setStabilizeStrength(_ value: Float) {
+        stabilizer.strength = value          // setter 側でクランプされる
+        stabilizeStrength = stabilizer.strength
+    }
+
     private func adjustBrushRadius(by delta: Float) {
         guard let engine else { return }
         setBrushRadius(engine.brush.baseRadius + delta)
@@ -156,20 +173,30 @@ final class CanvasView: MTKView {
         onStatus?("\(engine.brush.name)  r\(Int(engine.brush.baseRadius))" + pressureInfo)
     }
 
+    /// ビュー座標(y 上向き)→ グリッド座標(y 下向き)
+    private func gridPoint(from event: NSEvent) -> SIMD2<Float> {
+        let loc = convert(event.locationInWindow, from: nil)
+        return SIMD2<Float>(Float(loc.x), Float(bounds.height - loc.y))
+    }
+
     private func addSample(from event: NSEvent) {
         guard let engine else { return }
-        let loc = convert(event.locationInWindow, from: nil)
-        // ビュー座標(y 上向き)→ グリッド座標(y 下向き)
-        let point = SIMD2<Float>(Float(loc.x), Float(bounds.height - loc.y))
+        let point = gridPoint(from: event)
 
         // タブレット(XPPEN/Wacom 等)はドライバが NSEvent に実筆圧を載せてくる。
-        // マウスは速度からの擬似筆圧にフォールバック。
+        // マウスは速度からの擬似筆圧にフォールバック。速度は補正前の実カーソルで測る。
         let isTablet = event.subtype == .tabletPoint
         let pressure: Float = isTablet
             ? event.pressure
             : pressureEstimator.estimate(point: point, time: event.timestamp)
 
-        engine.addStrokeSample(at: point, pressure: pressure)
+        lastRawPoint = point
+        lastPressure = pressure
+
+        // 手ブレ補正: 揺れの範囲内なら点を打たない(ドウェル供給は activeDab 任せで継続)。
+        if let smoothed = stabilizer.process(point) {
+            engine.addStrokeSample(at: smoothed, pressure: pressure)
+        }
         updateStatus(pressureInfo: String(
             format: "   筆圧 %.2f (%@)", pressure, isTablet ? "tablet" : "pseudo"
         ))
@@ -209,5 +236,23 @@ final class CanvasView: MTKView {
         engine.endStroke()
 
         engine.brush = original
+    }
+
+    /// 検証用(--demo-stabilize): 点列を実際のスタビライザ経路(reset→process→flush)で描く。
+    /// strength=0 で補正なし、>0 で補正あり。ライブ入力と同じ StrokeStabilizer を通す。
+    func drawStabilizedStroke(points: [SIMD2<Float>], pressure: Float, strength: Float) {
+        guard let engine, let first = points.first, let last = points.last else { return }
+        stabilizer.strength = strength
+        stabilizer.reset(at: first)
+        engine.beginStroke()
+        for p in points {
+            if let smoothed = stabilizer.process(p) {
+                engine.addStrokeSample(at: smoothed, pressure: pressure)
+            }
+        }
+        for p in stabilizer.flush(to: last) {
+            engine.addStrokeSample(at: p, pressure: pressure)
+        }
+        engine.endStroke()
     }
 }
