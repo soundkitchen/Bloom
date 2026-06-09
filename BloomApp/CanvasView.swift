@@ -156,8 +156,10 @@ final class CanvasView: MTKView {
     }
 
     /// 手ブレ補正の強さ(0...1)。ブラシ非依存のグローバル入力設定(インスペクタのスライダから)。
+    /// 進行中のストロークにも即時反映する(StrokeStabilizer は実行中の強度変更に対して安全)。
     func setStabilizeStrength(_ value: Float) {
-        stabilizeStrength = min(max(value, 0), 1)
+        stabilizer.strength = value          // setter 側でクランプされる
+        stabilizeStrength = stabilizer.strength
     }
 
     private func adjustBrushRadius(by delta: Float) {

@@ -26,11 +26,11 @@ public struct StrokeStabilizer: Sendable {
         set { _strength = min(max(newValue, 0), 1) }
     }
 
-    /// 現在の紐の長さ[pt](= 出力が実カーソルから遅れる上限)。
-    public var leashLength: Float { _strength * maxLength }
+    /// 現在の紐の長さ[pt](= 出力が実カーソルから遅れる上限)。内部 / テスト用。
+    var leashLength: Float { _strength * maxLength }
 
-    /// 現在の出力位置(平滑化後)。ストローク開始前は nil。
-    public var outputPoint: SIMD2<Float>? { anchor }
+    /// 現在の出力位置(平滑化後)。ストローク開始前は nil。内部 / テスト用。
+    var outputPoint: SIMD2<Float>? { anchor }
 
     public init(strength: Float = 0) {
         _strength = min(max(strength, 0), 1)
