@@ -14,15 +14,16 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
        ├─ SimulationEngine   滲みシミュレーション + レイヤー/フレーム + 描画(Metal compute)
        ├─ AnimationExport     GIF / スプライトシート / PNG 連番(extension)
        ├─ Simulation.metal    カーネル群(framework の default.metallib にコンパイル)
-       └─ InputSample         入力抽象 + 擬似筆圧
+       ├─ InputSample         入力抽象 + 擬似筆圧
+       └─ StrokeStabilizer    手ブレ補正(プルストリング方式)
 ```
 
 ### アプリの UI 構成
 
 通常起動は **中央キャンバス + 右インスペクタ + 下タイムライン + 最下部ステータスバー**(手動フレームレイアウト、ウィンドウ固定サイズ)。
 
-- `CanvasView` と `InspectorView` はクロージャで疎結合: `canvas.onStatus`/`onBrushChanged`/`onLayersChanged` ↔ `inspector.onSelectBrush`/`onSizeChange`/`onWaterChange`/`onColorChange`/`onClear`/`onAddLayer`/`onDeleteLayer`/`onSelectLayer`/`onToggleLayer`。キー操作(`1`/`2`/`[`/`]`)とスライダは双方向に同期する
-- インスペクタの中身: ブラシ切替・カラーウェル(任意色)・サイズ/水量スライダ・**レイヤーリスト(NSTableView)**(目アイコンで表示切替、選択でアクティブ化、**行の D&D で並べ替え** → `moveLayer`、＋/🗑 で追加削除)・選択層の不透明スライダ・クリア
+- `CanvasView` と `InspectorView` はクロージャで疎結合: `canvas.onStatus`/`onBrushChanged`/`onLayersChanged` ↔ `inspector.onSelectBrush`/`onSizeChange`/`onWaterChange`/`onStabilizeChange`/`onColorChange`/`onClear`/`onAddLayer`/`onDeleteLayer`/`onSelectLayer`/`onToggleLayer`。キー操作(`1`/`2`/`[`/`]`)とスライダは双方向に同期する
+- インスペクタの中身: ブラシ切替・カラーウェル(任意色)・サイズ/水量スライダ・**手ブレ補正スライダ**(ブラシ非依存のグローバル入力設定)・**レイヤーリスト(NSTableView)**(目アイコンで表示切替、選択でアクティブ化、**行の D&D で並べ替え** → `moveLayer`、＋/🗑 で追加削除)・選択層の不透明スライダ・クリア
 - レイヤーリストは `reflectLayers` でエンジン状態を反映。プログラム選択時の `selectionDidChange` ループは `isReflecting` フラグで抑止
 - **編集メニュー**: 取り消す(Cmd+Z)/ やり直す(Cmd+Shift+Z)。`validateMenuItem` で `canUndo`/`canRedo` に応じて有効化
 - **ファイルメニュー**: 開く(Cmd+O)/ 保存(Cmd+S)/ 別名で保存(Cmd+Shift+S)/ PNG(Cmd+E)/ GIF(Cmd+G)/ スプライトシート(Cmd+Shift+G)/ PNG 連番 を書き出す。NSOpenPanel/NSSavePanel
@@ -145,6 +146,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 
 - **タブレット**: `NSEvent.subtype == .tabletPoint` なら `event.pressure` の実筆圧を使う(XPPEN/Wacom ともドライバが標準 NSEvent に載せてくる)。未実測 — XPPEN Deco での確認は M0a 参照
 - **マウス**: `PseudoPressureEstimator` がカーソル速度から擬似筆圧を生成(速い = 軽い)。ローパスで平滑化。ユニットテストあり
+- **手ブレ補正**(`StrokeStabilizer`): プルストリング(ラバーバンド)方式で入力点列を平滑化。出力点(anchor)が実カーソルへ向かい、両者の距離が紐長 `L = strength × 48pt` を超えた分だけ追従する(揺れ `< L` は吸収)。**幾何ベースで dt 非依存**なのでサンプルレートが揺れても挙動が安定。**位置のみ**平滑化(筆圧はいじらない)。`CanvasView` の入力経路で適用し、MCP 等が `addStrokeSample` に渡す意図的な座標は補正しない。プル方式は出力が遅れるので `endStroke` 時に `flush` で実終点まで補完して線を届かせる。強度はブラシ非依存の**グローバル設定**(インスペクタの「手ブレ」スライダ)。ユニットテストあり
 - ストロークはコア側でスタンプ間隔(`radius × 0.3`)に補間される
 
 ## ビルド構成
@@ -156,6 +158,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
   - ドウェル(置きっぱなし)の確認は `BloomApp --demo-dwell --snapshot-dir <dir>` → `pooled.png`(溜まり)/ `dried.png`(乾いた輪っか)
   - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`、保存/読み込みは `--demo-saveload`
   - アニメーションは `--demo-anim`(数フレーム→ GIF/スプライト/連番)、オニオンは `--demo-onion`(前フレームのゴースト)
+  - 手ブレ補正は `--demo-stabilize`(同じ揺れた入力を補正なし/あり で描き比べ → `stabilize-off.png` / `stabilize-on.png`)
 
 ### ハマりどころ(再発時のために)
 

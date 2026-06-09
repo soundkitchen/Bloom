@@ -9,6 +9,7 @@ final class InspectorView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onSelectBrush: ((SimulationEngine.Brush) -> Void)?
     var onSizeChange: ((Float) -> Void)?
     var onWaterChange: ((Float) -> Void)?
+    var onStabilizeChange: ((Float) -> Void)? // 手ブレ補正の強さ(グローバル入力設定)
     var onColorChange: ((SIMD3<Float>) -> Void)?
     var onClear: (() -> Void)?
 
@@ -26,8 +27,10 @@ final class InspectorView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     )
     private let sizeSlider = NSSlider(value: 22, minValue: 4, maxValue: 80, target: nil, action: nil)
     private let waterSlider = NSSlider(value: 0.9, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let stabilizeSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let sizeLabel = InspectorView.makeValueLabel()
     private let waterLabel = InspectorView.makeValueLabel()
+    private let stabilizeLabel = InspectorView.makeValueLabel()
     private let colorWell = NSColorWell()
 
     private let layerTable = NSTableView()
@@ -119,6 +122,10 @@ final class InspectorView: NSView, NSTableViewDataSource, NSTableViewDelegate {
                                                     self, #selector(sizeChanged)))
         stack.addArrangedSubview(Self.makeSliderRow("水量", waterSlider, waterLabel,
                                                     self, #selector(waterChanged)))
+        // 手ブレ補正(ブラシ非依存のグローバル入力設定)
+        stack.addArrangedSubview(Self.makeSliderRow("手ブレ", stabilizeSlider, stabilizeLabel,
+                                                    self, #selector(stabilizeChanged)))
+        stabilizeLabel.stringValue = String(format: "%.2f", stabilizeSlider.floatValue)
         stack.addArrangedSubview(Self.makeSeparator())
 
         // --- レイヤー ---
@@ -234,6 +241,11 @@ final class InspectorView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     @objc private func waterChanged() {
         waterLabel.stringValue = String(format: "%.2f", waterSlider.floatValue)
         onWaterChange?(waterSlider.floatValue)
+    }
+
+    @objc private func stabilizeChanged() {
+        stabilizeLabel.stringValue = String(format: "%.2f", stabilizeSlider.floatValue)
+        onStabilizeChange?(stabilizeSlider.floatValue)
     }
 
     @objc private func opacityChanged() {
