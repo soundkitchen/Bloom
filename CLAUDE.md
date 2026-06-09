@@ -49,6 +49,7 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 - `--demo-onion` … オニオンスキン(前フレームのゴースト)
 - `--demo-stabilize` … 手ブレ補正(同じ揺れた入力を補正なし/あり で描き比べ → stabilize-off.png / stabilize-on.png)
 - `--demo-sumi` … 墨のかすれ(筆圧違いの 3 本 = 高圧/低圧/払い → sumi.png)
+- `--demo-guide` … 使い方ガイドの作例(水彩ウォッシュ + 墨レイヤーの葦 → guide-watercolor.png / guide-hero.png)
 
 描き味やレンダリングの変更は、この PNG スナップショットを目視で確認しながら詰める。
 
@@ -57,7 +58,7 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 - `BloomCore/`(framework・AppKit 非依存) … 描画コア。`SimulationEngine`(滲みシミュレーション + レイヤー/フレーム + 合成)、`Simulation.metal`(GPU カーネル)、`AnimationExport`(GIF/スプライト/連番)、`InputSample`(入力抽象 + 擬似筆圧)、`StrokeStabilizer`(手ブレ補正)
 - `BloomApp/`(app・AppKit + MetalKit) … `CanvasView`(入力 → コア API)、`InspectorView`(ブラシ/色/レイヤー)、`TimelineView`(フレーム/再生/オニオン)、`AppDelegate`(ウィンドウ・メニュー・再生)
 - `BloomCoreTests/` … ユニットテスト
-- `docs/` … `idea.md`(構想)、`architecture.md`(コードの現在形)、`devlog/`(日付つき経緯)、`images/`
+- `docs/` … `idea.md`(構想)、`architecture.md`(コードの現在形)、`guide.md`(ユーザー向け使い方ガイド)、`devlog/`(日付つき経緯)、`images/`
 
 設計原則: **UI とコアの分離**(コアはヘッドレスで動き、将来の MCP サーバも同じコマンド API を叩く)。詳細は `docs/architecture.md`。
 

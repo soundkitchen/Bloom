@@ -1,6 +1,6 @@
 # Bloom アーキテクチャ
 
-コードの「現在形」を説明する生きたドキュメント。経緯は [devlog](devlog/)、構想は [idea.md](idea.md) を参照。
+コードの「現在形」を説明する生きたドキュメント。経緯は [devlog](devlog/)、構想は [idea.md](idea.md)、ユーザー向けの使い方は [guide.md](guide.md) を参照。
 
 ## 全体構成
 
@@ -162,6 +162,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
   - アニメーションは `--demo-anim`(数フレーム→ GIF/スプライト/連番)、オニオンは `--demo-onion`(前フレームのゴースト)
   - 手ブレ補正は `--demo-stabilize`(同じ揺れた入力を補正なし/あり で描き比べ → `stabilize-off.png` / `stabilize-on.png`)
   - 墨のかすれは `--demo-sumi`(墨ブラシで筆圧違いの 3 本 = 高圧/低圧/払い を描く → `sumi.png`)
+  - 使い方ガイドの作例は `--demo-guide`(水彩ウォッシュ → 乾燥 → 墨レイヤーで葦のかすれを重ねる → `guide-watercolor.png` / `guide-hero.png`)
 
 ### ハマりどころ(再発時のために)
 
