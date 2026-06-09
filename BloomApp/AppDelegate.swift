@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
 
         let args = CommandLine.arguments
-        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion", "--demo-stabilize"]
+        let demoModes = ["--demo", "--demo-dwell", "--demo-layers", "--demo-undo", "--demo-saveload", "--demo-anim", "--demo-onion", "--demo-stabilize", "--demo-sumi"]
         if demoModes.contains(where: args.contains) {
             // 検証モードはキャンバス全面(スナップショットを汚さない)
             buildDemoWindow(small: args.contains("--demo-dwell"))
@@ -226,6 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--demo-stabilize") {
             runStabilizeDemo(snapshotDir: snapshotDir)
+            return
+        }
+        if args.contains("--demo-sumi") {
+            runSumiDemo(snapshotDir: snapshotDir)
             return
         }
 
@@ -499,6 +503,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.1) {
             try? engine.savePNG(to: dir.appendingPathComponent("stabilize-on.png")) // なめらか
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// 墨のかすれ検証(--demo-sumi): 同じ墨ブラシで筆圧の異なる 3 本を描く。
+    /// 上=高圧(ほぼ繋がる)/ 中=低圧(全体にかすれる)/ 下=払い(高圧→低圧でかすれが育つ)。
+    /// 低水なのですぐ沈着する。1 枚 sumi.png にまとめて目視チューニングする。
+    private func runSumiDemo(snapshotDir: URL?) {
+        guard let engine = canvas?.engine else { return }
+        let w = Float(engine.gridWidth), h = Float(engine.gridHeight)
+
+        /// y を基準にした水平線。pressure(t) を与えて筆圧を変える。
+        func horizontal(baselineY: Float, pressure: (Float) -> Float) {
+            engine.beginStroke()
+            for i in 0..<160 {
+                let t = Float(i) / 159
+                engine.addStrokeSample(at: SIMD2(0.1 * w + 0.8 * w * t, baselineY),
+                                       pressure: pressure(t))
+            }
+            engine.endStroke()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            engine.brush = .sumi
+            horizontal(baselineY: 0.25 * h) { _ in 1.0 }            // 高圧: ほぼ繋がる
+            horizontal(baselineY: 0.5 * h)  { _ in 0.35 }           // 低圧: 全体にかすれる
+            horizontal(baselineY: 0.75 * h) { t in 1.0 - 0.9 * t }  // 払い: かすれが育つ
+        }
+        guard let dir = snapshotDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            try? engine.savePNG(to: dir.appendingPathComponent("sumi.png"))
             NSApp.terminate(nil)
         }
     }

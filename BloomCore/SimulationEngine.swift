@@ -58,6 +58,7 @@ public final class SimulationEngine {
         var water: Float
         var pigment: SIMD3<Float> // RGB 吸光度の増分(色 × 量)
         var dryness: Float
+        var dir: SIMD2<Float>     // ストローク進行方向(単位ベクトル)。毛筋の向き。静止時は 0
     }
 
     /// ブラシ特性
@@ -267,7 +268,7 @@ public final class SimulationEngine {
         let sample = InputSample(position: position, pressure: max(0, min(pressure, 1)))
         activeDab = sample // ドウェル供給は常に最新のペン位置で行う(止めていても継ぎ足す)
         guard let last = lastStrokeSample else {
-            appendStamp(for: sample)
+            appendStamp(for: sample, dir: SIMD2(0, 0)) // 始点(入り)はまだ方向が無い
             lastStrokeSample = sample
             return
         }
@@ -276,12 +277,13 @@ public final class SimulationEngine {
         let steps = min(Int(dist / spacing), 200)
         // 間隔未満の移動ではスタンプを打たず、アンカーも進めない。
         guard steps > 0 else { return }
+        let dir = dist > 1e-4 ? (sample.position - last.position) / dist : SIMD2<Float>(0, 0)
         for i in 1...steps {
             let t = Float(i) / Float(steps)
             appendStamp(for: InputSample(
                 position: simd_mix(last.position, sample.position, SIMD2(repeating: t)),
                 pressure: last.pressure + (sample.pressure - last.pressure) * t
-            ))
+            ), dir: dir)
         }
         lastStrokeSample = sample
     }
@@ -299,7 +301,8 @@ public final class SimulationEngine {
             radius: stampRadius(pressure: dab.pressure) * 1.1,
             water: brush.water * dab.pressure * dwellWaterRate,
             pigment: brush.absorbance * (brush.pigment * dab.pressure * dwellPigmentRate),
-            dryness: brush.dryness
+            dryness: effectiveDryness(pressure: dab.pressure),
+            dir: SIMD2(0, 0) // 据え置きの供給は方向なし(毛筋を作らない)
         ))
     }
 
@@ -898,14 +901,27 @@ public final class SimulationEngine {
         brush.baseRadius * (brush.minRadiusFactor + (1 - brush.minRadiusFactor) * pressure)
     }
 
-    private func appendStamp(for sample: InputSample) {
+    /// 墨のかすれは「軽いタッチ・速い筆・乾いた筆ほど強い」。乾いた筆(dryness>0)にだけ効かせ、
+    /// 水彩(dryness 0)はウェットのまま触らない。筆圧が抜けるほど実効 dryness を 1 へ寄せる
+    /// (入り・抜き・速いマウス払いでかすれる。マウスは擬似筆圧が速度→筆圧に変換済み)。
+    /// 水量スライダを上げると水で埋まってかすれが減る。
+    private func effectiveDryness(pressure: Float) -> Float {
+        let d = brush.dryness
+        guard d > 0 else { return 0 }
+        let lighten = (1 - d) * (1 - pressure) * 0.6     // 軽いタッチでかすれを足す
+        let wetFill = max(0, brush.water - 0.15) * 0.6   // 水を増やすと埋まる
+        return simd_clamp(d + lighten - wetFill, 0, 1)
+    }
+
+    private func appendStamp(for sample: InputSample, dir: SIMD2<Float>) {
         guard pendingStamps.count < maxStampsPerFrame else { return }
         pendingStamps.append(Stamp(
             pos: sample.position,
             radius: stampRadius(pressure: sample.pressure),
             water: brush.water * (0.4 + 0.6 * sample.pressure),
             pigment: brush.absorbance * (brush.pigment * (0.3 + 0.7 * sample.pressure)),
-            dryness: brush.dryness
+            dryness: effectiveDryness(pressure: sample.pressure),
+            dir: dir
         ))
     }
 

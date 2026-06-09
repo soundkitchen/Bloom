@@ -54,6 +54,7 @@ struct Stamp {
     float  water;
     float3 pigment;  // RGB 吸光度の増分(色 × 量)
     float  dryness;  // 0: ウェット(全面に乗る) / 1: ドライ(紙の凸部にだけ乗る = かすれ)
+    float2 dir;      // ストローク進行方向(単位ベクトル)。毛筋の向き。動いていなければ 0
 };
 
 static inline uint idxOf(uint2 g, uint width) { return g.y * width + g.x; }
@@ -79,10 +80,25 @@ kernel void stampKernel(device float*        W      [[buffer(0)]],
             float t = d / r;
             float fall = 1.0 - t * t;
             fall *= fall; // 柔らかい四次フォールオフ
-            // ドライブラシ: 紙の凸部(H 高)にだけ顔料が引っかかる = かすれ
-            float grainMask = mix(1.0, smoothstep(0.45, 0.62, h), stamps[s].dryness);
-            w += stamps[s].water * fall * grainMask;
-            p += stamps[s].pigment * (fall * grainMask);
+            // ドライブラシ(かすれ): dryness が高いほど被覆が割れる。
+            float coverage = fall;
+            float dry = stamps[s].dryness;
+            if (dry > 0.001) {
+                // 1) 紙の凸部(H 高)にだけ顔料が引っかかる粒状の下地
+                float grain = max(smoothstep(0.42, 0.62, h), 0.35);
+                // 2) 筆の毛筋: 進行方向に沿った縦縞。直交座標で帯を作り、紙で位相を乱す
+                float streak = 1.0;
+                float2 dir = stamps[s].dir;
+                if (dot(dir, dir) > 1e-6) {
+                    float perp = dot(pos - stamps[s].pos, float2(-dir.y, dir.x));
+                    float band = 0.5 + 0.5 * sin(perp * 0.7 + h * 8.0);
+                    streak = smoothstep(0.34, 0.72, band);
+                }
+                // dry=0 で全面、dry=1 で grain×streak の割れた被覆へ寄せる(floor を残し線が切れすぎない)
+                coverage = fall * mix(1.0, grain * streak, dry);
+            }
+            w += stamps[s].water * coverage;
+            p += stamps[s].pigment * coverage;
         }
     }
     // 水の上限を高めに取ると、中心に高い水頭の溜まりができて外へ押し出す力が生まれる(ブルーム)

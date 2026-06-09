@@ -48,6 +48,7 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 - `--demo-anim` … 数フレーム → GIF / スプライトシート / PNG 連番
 - `--demo-onion` … オニオンスキン(前フレームのゴースト)
 - `--demo-stabilize` … 手ブレ補正(同じ揺れた入力を補正なし/あり で描き比べ → stabilize-off.png / stabilize-on.png)
+- `--demo-sumi` … 墨のかすれ(筆圧違いの 3 本 = 高圧/低圧/払い → sumi.png)
 
 描き味やレンダリングの変更は、この PNG スナップショットを目視で確認しながら詰める。
 

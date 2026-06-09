@@ -53,7 +53,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 毎フレーム `dwell → stamp → (flow → dry) × 3 substeps → render` の順で実行:
 
 - **ドウェル供給(emitDwellStamp)** — 筆を下ろしている間(`activeDab != nil`)、動かさなくても毎フレーム現在位置へ少量の水・顔料を継ぎ足す。止めたまま置くと溜まりが育ち、乾くと縁が濃い輪っか(ブルーム)が出る = 実際の筆の挙動。`beginStroke`〜`endStroke` の間だけ有効。移動中は最新のペン位置へ供給されるので筆跡にも乗る。フレームレート依存(120fps 前提)は将来課題
-- **stampKernel** — ブラシスタンプ。筆圧が半径と水・顔料量に効く。四次フォールオフ。`dryness` が高いと紙の凸部(H 高)にだけ顔料が乗る = **かすれ**(ドライブラシ)
+- **stampKernel** — ブラシスタンプ。筆圧が半径と水・顔料量に効く。四次フォールオフ。`dryness` が高いと被覆が割れて **かすれ**(ドライブラシ)になる: ①紙の凸部(H 高)にだけ乗る粒状の下地 + ②進行方向 `dir` に沿った**毛筋**(直交座標の周期縞・紙で位相を乱す)。`dryness` でこの割れた被覆へ寄せる(floor を残して線が切れすぎないようにする)。実効 `dryness` は筆圧で動く(下の入力節)
 - **flowKernel** — 水頭 `W + paperInfluence·H` の隣接差分で水が移動し、顔料を運ぶ。乾いたセル(`W ≤ wetThreshold`)からは流れない = ピン留めで硬いエッジができる。対称な流量制限(`min(f, w·0.2)`)で質量保存。W/P はピンポンバッファ
 - **dryKernel** — 蒸発。濡れた隣接セルが少ない「縁」ほど速く乾く(`edgeEvapBoost`)→ エッジダークニングの源。失われた水の割合に応じて P → D へ沈着し、紙の谷(H 低)ほど多く沈着(`granulation`)
 - **renderKernel** — 紙を底に、下層 → アクティブ層(`D` + ウェット `P`)→ 上層 のアフィングレーズ変換を順に適用(下の「レイヤー / タイムライン」節)。オニオン有効時は前フレームを薄く重ねる。バイリニア補間で drawable 解像度へ
@@ -66,6 +66,8 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 |---|---|---|---|---|---|---|
 | `.watercolor` 水彩(藍) | 22 | 0.9 | 0.16 | (0.22, 0.34, 0.60) | 0 | `1` |
 | `.sumi` 墨(かすれ) | 14 | 0.10 | 0.55 | (0.10, 0.10, 0.11) | 0.85 | `2` |
+
+`dryness` はプリセット値そのままではなく **実効値**(`effectiveDryness(pressure:)`)で使う。乾いた筆(`dryness > 0`)だけ、**筆圧が抜けるほどかすれを強める**(`+ (1-dryness)·(1-pressure)·0.6`)/ **水量を上げると埋める**(`- max(0, water-0.15)·0.6`)。マウスは擬似筆圧が速度→筆圧に変換済みなので「速い払い=かすれる」も筆圧経由で付く。水彩(`dryness 0`)は実効も 0 で従来どおり。
 
 ### レイヤー / タイムライン(セル方式)
 
@@ -140,7 +142,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 
 - バッファは `storageModeShared` の `MTLBuffer`(float 配列)。テクスチャの read_write Tier 問題を避けるため
 - `dryKernel` の隣接セル読みは in-place(他スレッド更新中の値が混ざる近似)。視覚目的には十分
-- Swift 側 `SimParams` / `Stamp` 構造体は MSL とレイアウト一致が必須(`Stamp` は float2 を含むため stride 32。フィールドを足したら両側を同時に更新すること)
+- Swift 側 `SimParams` / `Stamp` 構造体は MSL とレイアウト一致が必須(`Stamp` は `pos`/`dir` の float2 と float3 `pigment` を含み stride 48。`dir` は `dryness` の後ろの padding に収まる。フィールドを足したら両側を同時に更新すること。ずれるとスタンプ位置や色が壊れて即わかる)
 
 ## 入力
 
@@ -159,6 +161,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
   - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`、保存/読み込みは `--demo-saveload`
   - アニメーションは `--demo-anim`(数フレーム→ GIF/スプライト/連番)、オニオンは `--demo-onion`(前フレームのゴースト)
   - 手ブレ補正は `--demo-stabilize`(同じ揺れた入力を補正なし/あり で描き比べ → `stabilize-off.png` / `stabilize-on.png`)
+  - 墨のかすれは `--demo-sumi`(墨ブラシで筆圧違いの 3 本 = 高圧/低圧/払い を描く → `sumi.png`)
 
 ### ハマりどころ(再発時のために)
 
