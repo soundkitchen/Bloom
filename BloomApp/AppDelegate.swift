@@ -584,7 +584,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let dir = snapshotDir else { return }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) {
+        // 水彩が十分乾いてから保存 + 墨レイヤーへ。乾く前に層を切り替えると残りの濡れ顔料が
+        // 墨レイヤーに沈着する(§5 の意味論どおりだが作例としては不要)ので余裕を取る。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
             try? engine.savePNG(to: dir.appendingPathComponent("guide-watercolor.png")) // 水彩のみ(乾いた)
             engine.addLayer() // 墨は上のレイヤーへ
             // 岸から立ち上がる葦を数本。穂先へ向けて低圧=かすれ。横位置を散らし、弓なりに。
@@ -595,7 +597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sumiReed(baseX: 0.30 * w, baseY: 0.46 * h, tipX: 0.24 * w, tipY: 0.40 * h, p0: 0.35, p1: 0.04, bow: 0.0)
             sumiReed(baseX: 0.39 * w, baseY: 0.50 * h, tipX: 0.45 * w, tipY: 0.45 * h, p0: 0.32, p1: 0.04, bow: 0.0)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12.5) {
             try? engine.savePNG(to: dir.appendingPathComponent("guide-hero.png")) // 完成
             NSApp.terminate(nil)
         }
