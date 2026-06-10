@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 @testable import BloomCore
 
 @MainActor
@@ -81,6 +82,43 @@ final class AnimationTests: XCTestCase {
         try b.loadDocument(from: url)
         XCTAssertEqual(b.frameTotal, 3)
         XCTAssertEqual(b.layerCount, 2)
+    }
+
+    private func tempMP4URL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("bloom-mp4-\(UUID().uuidString).mp4")
+    }
+
+    func testExportMP4ProducesPlayableVideo() async throws {
+        let e = try SimulationEngine(width: 64, height: 48) // 偶数
+        e.addFrame(); e.addFrame() // 3 フレーム
+        let url = tempMP4URL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try e.exportMP4(to: url, fps: 12)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        XCTAssertEqual(tracks.count, 1, "動画トラックが 1 本ある")
+        let duration = try await asset.load(.duration)
+        XCTAssertGreaterThan(duration.seconds, 0, "尺がある")
+    }
+
+    func testExportMP4RoundsToEvenDimensions() async throws {
+        let e = try SimulationEngine(width: 65, height: 49) // 奇数 → 64×48 に丸まる想定
+        e.addFrame()
+        let url = tempMP4URL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertNoThrow(try e.exportMP4(to: url, fps: 12), "奇数寸法でも throw しない")
+
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let size = try await track.load(.naturalSize)
+        XCTAssertEqual(size.width, 64, "幅は偶数へ切り捨て")
+        XCTAssertEqual(size.height, 48, "高さは偶数へ切り捨て")
     }
 
     /// v1 ドキュメント(単一フレーム)を手組みして後方互換読み込みを検証

@@ -96,6 +96,7 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 `renderFrameCGImage()`(現フレーム合成 → CGImage)を全フレームに回して書く(書き出し中はオニオン無効・currentFrame は復元):
 
 - `exportGIF(to:fps:loop:)` — ImageIO の `CGImageDestination`(GIF)+ フレーム遅延/ループ
+- `exportMP4(to:fps:)` — `AVAssetWriter` で H.264/`.mp4`。各フレームを `CVPixelBuffer`(BGRA)化して append。寸法は偶数へ切り捨て(H.264 要件・右端/下端 1px)。UI からは fps をタイムラインの再生速度に追従させて渡す
 - `exportSpriteSheet(to:columns:)` — 格子 1 枚 PNG + メタ `.json`(frameWidth/Height/count/columns)。Unity/Unreal でスライス可能
 - `exportPNGSequence(to:)` — `frame_0001.png …`
 

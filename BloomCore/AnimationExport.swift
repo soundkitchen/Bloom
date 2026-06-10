@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import AVFoundation
 
 /// アニメーション書き出し: GIF / スプライトシート / PNG 連番。
 /// 各フレームに移動して合成を CGImage 化(`renderFrameCGImage`)し、ImageIO/CoreGraphics で書く。
@@ -84,5 +85,99 @@ extension SimulationEngine {
         let meta = "{\"frameWidth\":\(fw),\"frameHeight\":\(fh)," +
                    "\"frameCount\":\(frames.count),\"columns\":\(cols),\"rows\":\(rows)}"
         try meta.data(using: .utf8)?.write(to: url.deletingPathExtension().appendingPathExtension("json"))
+    }
+
+    /// アニメーション MP4(H.264)。fps は 1 秒あたりのフレーム数。
+    /// H.264 は偶数寸法を要求するので出力幅高を偶数へ切り捨て(右端/下端 1px を落とす)。
+    public func exportMP4(to url: URL, fps: Double = 12) throws {
+        let frames = try renderAllFrames()
+        guard !frames.isEmpty else { return }
+
+        // H.264 のマクロブロック要件で寸法を偶数化(寸法・バッファ・draw 先を一貫させる)
+        let outW = gridWidth & ~1, outH = gridHeight & ~1
+        guard outW >= 2, outH >= 2 else { throw EngineError.pipelineFailed("mp4 size") }
+
+        // 既存ファイルが残っていると AVAssetWriter(outputURL:) が失敗する
+        try? FileManager.default.removeItem(at: url)
+
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: outW,
+            AVVideoHeightKey: outH,
+            // 色を BT.709 で明示(無指定だと解像度依存で 601/709 が揺れ、PNG/GIF と色がずれうる)。
+            // sRGB と BT.709 は原色・白色点が共通なので、水彩の色味を保つにはこれが妥当。
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
+        ])
+        input.expectsMediaDataInRealTime = false // オフライン書き出し
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: outW,
+                kCVPixelBufferHeightKey as String: outH,
+            ])
+        guard writer.canAdd(input) else { throw EngineError.pipelineFailed("mp4 add input") }
+        writer.add(input)
+
+        guard writer.startWriting() else {
+            throw EngineError.pipelineFailed("mp4 start: \(writer.error?.localizedDescription ?? "?")")
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // 600 は動画の慣例 timescale(整数・分数 fps の大半を正確に表せる)。
+        // fps を整数へ丸めず「フレーム長 × 連番」で PTS を作るので、非整数 fps(12.5 等)でも
+        // タイムラインに正確に追従し、極端な fps で Int32 変換が trap することもない。
+        let frameDuration = CMTime(seconds: 1.0 / max(fps, 1), preferredTimescale: 600)
+        for (i, img) in frames.enumerated() {
+            // オフラインなので基本すぐ ready。少数フレーム前提で sleep 付きスピン待ち
+            while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.002) }
+            guard let pool = adaptor.pixelBufferPool,
+                  let pb = makePixelBuffer(from: img, pool: pool, width: outW, height: outH) else {
+                writer.cancelWriting()
+                throw EngineError.pipelineFailed("mp4 pixelbuffer")
+            }
+            let pts = CMTimeMultiply(frameDuration, multiplier: Int32(i)) // フレーム数は Int32 に収まる
+            guard adaptor.append(pb, withPresentationTime: pts) else {
+                writer.cancelWriting()
+                throw EngineError.pipelineFailed("mp4 append: \(writer.error?.localizedDescription ?? "?")")
+            }
+        }
+        input.markAsFinished()
+
+        // finishWriting は非同期。完了ハンドラは AVFoundation 内部キューで発火するため
+        // メインスレッドで wait してもデッドロックしない(GIF の同期書き出しと同水準)。
+        let sem = DispatchSemaphore(value: 0)
+        writer.finishWriting { sem.signal() }
+        sem.wait()
+        if writer.status == .failed {
+            throw EngineError.pipelineFailed("mp4 finish: \(writer.error?.localizedDescription ?? "?")")
+        }
+    }
+
+    /// CGImage を MP4 用の CVPixelBuffer(BGRA)に描き込む。寸法はバッファ側(偶数)に合わせる。
+    private func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool,
+                                 width: Int, height: Int) -> CVPixelBuffer? {
+        var pbOut: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOut) == kCVReturnSuccess,
+              let pb = pbOut else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb),
+              let ctx = CGContext(
+                data: base, width: width, height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(pb), // プールはアラインで width*4 より大きいことがある
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        // CGContext は左下原点。偶数丸めで CGImage が 1px 大きいことがあるので上端基準で揃える。
+        ctx.draw(image, in: CGRect(x: 0, y: CGFloat(height) - CGFloat(image.height),
+                                   width: CGFloat(image.width), height: CGFloat(image.height)))
+        return pb
     }
 }

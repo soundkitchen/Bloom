@@ -434,6 +434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + step * Double(frames) + 1.5) {
             try? engine.exportGIF(to: dir.appendingPathComponent("anim.gif"), fps: 8)
+            try? engine.exportMP4(to: dir.appendingPathComponent("anim.mp4"), fps: 8)
             try? engine.exportSpriteSheet(to: dir.appendingPathComponent("sheet.png"))
             try? engine.exportPNGSequence(to: dir.appendingPathComponent("seq"))
             NSApp.terminate(nil)
@@ -633,6 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(.separator())
         add(fileMenu, "PNG を書き出す…", #selector(exportPNG), "e")
         add(fileMenu, "GIF を書き出す…", #selector(exportGIF), "g")
+        add(fileMenu, "MP4 を書き出す…", #selector(exportMP4), "m", [.command, .shift])
         add(fileMenu, "スプライトシートを書き出す…", #selector(exportSpriteSheet), "g", [.command, .shift])
         add(fileMenu, "PNG 連番を書き出す…", #selector(exportPNGSequence), "")
 
@@ -729,6 +731,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.nameFieldStringValue = exportBaseName + ".gif"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try engine.exportGIF(to: url, fps: 12) } catch { presentError(error, title: "GIF を書き出せませんでした") }
+    }
+
+    @objc private func exportMP4() {
+        guard let engine = canvas?.engine else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = exportBaseName + ".mp4"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // fps はタイムラインの再生速度に追従(再生どおりの速さで動画化される)
+        do { try engine.exportMP4(to: url, fps: playFps) } catch { presentError(error, title: "MP4 を書き出せませんでした") }
     }
 
     @objc private func exportSpriteSheet() {
