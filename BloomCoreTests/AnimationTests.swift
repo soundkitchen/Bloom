@@ -115,7 +115,8 @@ final class AnimationTests: XCTestCase {
 
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .video)
-        let size = try await tracks[0].load(.naturalSize)
+        let track = try XCTUnwrap(tracks.first)
+        let size = try await track.load(.naturalSize)
         XCTAssertEqual(size.width, 64, "幅は偶数へ切り捨て")
         XCTAssertEqual(size.height, 48, "高さは偶数へ切り捨て")
     }

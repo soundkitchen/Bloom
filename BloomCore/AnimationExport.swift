@@ -105,6 +105,13 @@ extension SimulationEngine {
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: outW,
             AVVideoHeightKey: outH,
+            // 色を BT.709 で明示(無指定だと解像度依存で 601/709 が揺れ、PNG/GIF と色がずれうる)。
+            // sRGB と BT.709 は原色・白色点が共通なので、水彩の色味を保つにはこれが妥当。
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
         ])
         input.expectsMediaDataInRealTime = false // オフライン書き出し
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -122,7 +129,10 @@ extension SimulationEngine {
         }
         writer.startSession(atSourceTime: .zero)
 
-        let timescale = Int32(max(fps, 1).rounded())
+        // 600 は動画の慣例 timescale(整数・分数 fps の大半を正確に表せる)。
+        // fps を整数へ丸めず「フレーム長 × 連番」で PTS を作るので、非整数 fps(12.5 等)でも
+        // タイムラインに正確に追従し、極端な fps で Int32 変換が trap することもない。
+        let frameDuration = CMTime(seconds: 1.0 / max(fps, 1), preferredTimescale: 600)
         for (i, img) in frames.enumerated() {
             // オフラインなので基本すぐ ready。少数フレーム前提で sleep 付きスピン待ち
             while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.002) }
@@ -131,7 +141,7 @@ extension SimulationEngine {
                 writer.cancelWriting()
                 throw EngineError.pipelineFailed("mp4 pixelbuffer")
             }
-            let pts = CMTime(value: CMTimeValue(i), timescale: timescale)
+            let pts = CMTimeMultiply(frameDuration, multiplier: Int32(i)) // フレーム数は Int32 に収まる
             guard adaptor.append(pb, withPresentationTime: pts) else {
                 writer.cancelWriting()
                 throw EngineError.pipelineFailed("mp4 append: \(writer.error?.localizedDescription ?? "?")")
