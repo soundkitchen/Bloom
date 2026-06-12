@@ -19,6 +19,8 @@ enum BloomMCPTools {
         case setBrush = "set_brush"
         case drawStrokes = "draw_strokes"
         case waitForDry = "wait_for_dry"
+        case dryNow = "dry_now"
+        case sampleColors = "sample_colors"
         case snapshot
         case clear
         case undo
@@ -139,9 +141,42 @@ enum BloomMCPTools {
             annotations: .init(readOnlyHint: true)
         ),
         Tool(
+            name: Name.dryNow.rawValue,
+            description: "ドライヤー: 乾燥を早送りして数秒で乾かす(蒸発を一時加速。エッジダークニング等の物理は保たれる)。"
+                + "にじみの成長はその時点で止まるので、にじみを最大限育てたいときは wait_for_dry を使う。"
+                + "乾いた本当の色・エッジを確認してから次の層を重ねる、という使い方が基本。",
+            inputSchema: ["type": "object", "properties": .object([:])]
+        ),
+        Tool(
+            name: Name.sampleColors.rawValue,
+            description: "指定座標の実際の表示色(sRGB)を返す。狙った色が出ているか・乾燥でどれだけ薄まったかを"
+                + "目視でなく実測で確認する。乾かしてから測ると仕上がりの色になる。",
+            inputSchema: [
+                "type": "object",
+                "required": ["points"],
+                "properties": [
+                    "points": [
+                        "type": "array", "minItems": 1, "maxItems": 64,
+                        "items": [
+                            "type": "object",
+                            "required": ["x", "y"],
+                            "properties": ["x": ["type": "number"], "y": ["type": "number"]],
+                        ],
+                    ]
+                ],
+            ],
+            annotations: .init(readOnlyHint: true)
+        ),
+        Tool(
             name: Name.snapshot.rawValue,
-            description: "現在のキャンバス(表示中フレームの合成)を PNG 画像で返す。描画結果の確認用。",
-            inputSchema: ["type": "object", "properties": .object([:])],
+            description: "現在のキャンバス(表示中フレームの合成)を PNG 画像で返す。描画結果の確認用。"
+                + "grid: true で 100pt 間隔の座標グリッドを焼き込む(位置のずれを座標で特定したいとき)。",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "grid": ["type": "boolean", "description": "座標グリッドを焼き込む(default false)"]
+                ],
+            ],
             annotations: .init(readOnlyHint: true)
         ),
         Tool(
@@ -183,10 +218,18 @@ enum BloomMCPTools {
         case .waitForDry:
             return try await waitForDry(arguments: arguments, engine: engine)
 
+        case .dryNow:
+            return try await dryNow(engine: engine)
+
+        case .sampleColors:
+            return try sampleColors(arguments: arguments, engine: engine)
+
         case .snapshot:
-            let png = try engine.makePNGData()
+            let grid = arguments["grid"]?.boolValue ?? false
+            let png = try engine.makePNGData(gridSpacing: grid ? 100 : nil)
             let caption = "フレーム \(engine.currentFrameIndex + 1)/\(engine.frameTotal)・"
                 + "\(engine.gridWidth)×\(engine.gridHeight)pt・wet_fraction=\(rounded(engine.wetFraction))"
+                + (grid ? "・グリッド 100pt 間隔" : "")
             return .init(content: [
                 imageContent(base64: png.base64EncodedString(), mimeType: "image/png"),
                 textContent(caption),
@@ -371,6 +414,69 @@ enum BloomMCPTools {
             result["hint"] = .string("タイムアウトしました。ウィンドウが隠れているとシミュレーションが進みません")
         }
         return .init(content: [textContent(try jsonText(.object(result)))])
+    }
+
+    // MARK: - dry_now / sample_colors
+
+    /// ドライヤー: 蒸発を一時加速して乾き切るまで待つ(通常 1 秒未満)。必ず係数を戻す
+    private static func dryNow(engine: SimulationEngine) async throws -> CallTool.Result {
+        let started = ContinuousClock.now
+        engine.evaporationBoost = 25
+        defer { engine.evaporationBoost = 1 }
+        var wet = engine.wetFraction
+        while wet >= dryThreshold {
+            if started.duration(to: .now) > .seconds(10) { break } // ウィンドウ非表示などの保険
+            try await Task.sleep(for: .milliseconds(100))
+            wet = engine.wetFraction
+        }
+        let waited = started.duration(to: .now)
+        let waitedSeconds = Double(waited.components.seconds) + Double(waited.components.attoseconds) * 1e-18
+        let dried = wet < dryThreshold
+        var result: [String: Value] = [
+            "dried": .bool(dried),
+            "waited_seconds": .double((waitedSeconds * 10).rounded() / 10),
+            "wet_fraction": .double(Double(rounded(wet))),
+        ]
+        if !dried {
+            result["hint"] = .string("乾き切りませんでした。ウィンドウが隠れているとシミュレーションが進みません")
+        }
+        return .init(content: [textContent(try jsonText(.object(result)))])
+    }
+
+    private static func sampleColors(
+        arguments: [String: Value], engine: SimulationEngine
+    ) throws -> CallTool.Result {
+        guard let pointsValue = arguments["points"]?.arrayValue, !pointsValue.isEmpty else {
+            throw MCPError.invalidParams("points(1 点以上)が必要です")
+        }
+        guard pointsValue.count <= 64 else {
+            throw MCPError.invalidParams("points は最大 64 点です")
+        }
+        var positions: [SIMD2<Float>] = []
+        for (i, pointValue) in pointsValue.enumerated() {
+            guard let point = pointValue.objectValue,
+                  let x = number(point["x"]), let y = number(point["y"]) else {
+                throw MCPError.invalidParams("points[\(i)] は {x, y} の形です")
+            }
+            positions.append(SIMD2(x, y))
+        }
+        let colors = try engine.sampleColors(at: positions)
+        let entries = zip(positions, colors).map { position, color -> Value in
+            .object([
+                "x": .double(Double(position.x)),
+                "y": .double(Double(position.y)),
+                "color": .array([
+                    .double(Double(rounded(color.x))),
+                    .double(Double(rounded(color.y))),
+                    .double(Double(rounded(color.z))),
+                ]),
+                "hex": .string(String(
+                    format: "#%02x%02x%02x",
+                    Int(color.x * 255), Int(color.y * 255), Int(color.z * 255)
+                )),
+            ])
+        }
+        return .init(content: [textContent(try jsonText(.array(entries)))])
     }
 
     // MARK: - 状態の整形

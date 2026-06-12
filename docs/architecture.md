@@ -179,7 +179,8 @@ Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPT
   - **スプライン補間**(`BloomCore/StrokePath`・Catmull-Rom): 制御点 5〜10 個で形を指定すれば約 2.5pt 間隔の点列に補間される(`smooth: false` で無効化可)。筆圧は制御点間で線形補間
   - **入り抜きプロファイル**(`pressure_profile`): flat / taper(両端細)/ entry(入り細)/ exit(払い)を正規化弧長で筆圧に乗算
   - **描画結果の自動返却**: `draw_strokes` の結果に描画直後の縮小プレビュー(長辺 400px・`makePNGData(maxDimension:)`)を毎回添付し、「描く → 見る → 外したら undo」のループを強制的に閉じる
-  - **画材レシピの注入**: サーバの `instructions` にウォッシュ/精密な線/かすれ払い等のパラメータレシピとワークフロー指針を記載
+  - **計器(目測の置き換え)**: モデルの細かい空間・色知覚は弱いので、`dry_now`(乾燥の早送り → プレビューと仕上がりの乖離を解消)・`sample_colors`(色の実測)・`snapshot {grid}`(座標グリッド・`BloomCore/SnapshotGrid` が CoreText で焼き込み)で「見る」を「測る」に置き換える
+  - **画材レシピの注入**: サーバの `instructions` にウォッシュ/精密な線/かすれ払い等のパラメータレシピと、明 → 暗の順で積む・層の前に乾かす等のワークフロー指針を記載
 - **乾燥待ち**: `wait_for_dry` は `SimulationEngine.wetFraction`(W バッファの CPU 走査・shared なので安価)を 250ms 間隔でポーリング。**ウィンドウが隠れると MTKView が止まりシミュレーションも進まない**ので、タイムアウト時はその旨のヒントを返す
 - **無効化**: `--no-mcp` で起動。`--demo` 系の検証モードではそもそも起動しない
 
@@ -190,8 +191,10 @@ Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPT
 | `get_canvas_info` | 寸法(原点左上・y 下向き・pt)・ブラシ・レイヤー・フレーム・wet_fraction・undo 可否を JSON で |
 | `set_brush` | preset(watercolor/sumi)+ color/radius/water/pigment/dryness の永続変更(インスペクタ追従) |
 | `draw_strokes` | 複数ストローク(points[]{x,y,pressure})。制御点はスプライン補間され、`pressure_profile` で入り抜き。ストローク単位の一時ブラシ上書き可。1 ストローク = 1 undo 単位。結果に縮小プレビュー画像が付く |
-| `wait_for_dry` | 乾くまで待つ(`timeout_seconds`、既定 15 秒) |
-| `snapshot` | 現フレームを base64 PNG(image content)で返す |
+| `wait_for_dry` | 自然乾燥を待つ(`timeout_seconds`、既定 15 秒)。にじみが最後まで育つ |
+| `dry_now` | ドライヤー: `evaporationBoost` を一時的に上げて数秒で乾かす(にじみの成長はそこで止まる)。終了時に必ず 1 へ復元 |
+| `sample_colors` | 指定座標の実際の表示色(sRGB + hex)を返す。色の出方を実測で確認 |
+| `snapshot` | 現フレームを base64 PNG(image content)で返す。`grid: true` で 100pt 座標グリッドを焼き込み |
 | `clear` / `undo` / `redo` | クリア(undo 可)・取り消し・やり直し |
 
 Phase 2(予定): `manage_layer` / `manage_frame` / `save_document` / `load_document`。

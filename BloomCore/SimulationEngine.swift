@@ -93,6 +93,11 @@ public final class SimulationEngine {
     public let gridHeight: Int
     public var brush = Brush.watercolor
 
+    /// 乾燥の早送り係数(ドライヤー)。1 = 通常。MCP の dry_now が一時的に上げて、
+    /// 終わったら必ず 1 に戻す。流れ(flow)はそのままに蒸発・沈着だけ速まるので、
+    /// エッジダークニング等の物理は保たれ、にじみの成長がその時点で止まる
+    public var evaporationBoost: Float = 1
+
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let stampPipeline: MTLComputePipelineState
@@ -789,6 +794,9 @@ public final class SimulationEngine {
 
         // 2. 水流 + 乾燥(substep)。乾燥沈着はアクティブセル(描画ターゲット)へ。
         let target = dryTarget
+        let savedEvapRate = params.evapRate
+        params.evapRate *= simd_clamp(evaporationBoost, 1, 100)
+        defer { params.evapRate = savedEvapRate }
         for _ in 0..<substepsPerFrame {
             enc.setComputePipelineState(flowPipeline)
             enc.setBuffer(waterA, offset: 0, index: 0)
@@ -886,13 +894,15 @@ public final class SimulationEngine {
     }
 
     /// 現フレームを PNG データにする(ファイル書き出し・スナップショット返却で共用)。
-    /// maxDimension を指定すると長辺がその値になるよう縮小する(プレビュー用)。
-    public func makePNGData(maxDimension: Int? = nil) throws -> Data {
+    /// - maxDimension: 長辺がこの値になるよう縮小する(プレビュー用)
+    /// - gridSpacing: 指定 pt 間隔の座標グリッド + ラベルを焼き込む(MCP の位置確認用)
+    public func makePNGData(maxDimension: Int? = nil, gridSpacing: Int? = nil) throws -> Data {
         var cgImage = try renderFrameCGImage()
+        var scale: CGFloat = 1
         if let maxDim = maxDimension, maxDim >= 8, max(gridWidth, gridHeight) > maxDim {
-            let scale = Float(maxDim) / Float(max(gridWidth, gridHeight))
-            let w = max(Int(Float(gridWidth) * scale), 1)
-            let h = max(Int(Float(gridHeight) * scale), 1)
+            scale = CGFloat(maxDim) / CGFloat(max(gridWidth, gridHeight))
+            let w = max(Int(CGFloat(gridWidth) * scale), 1)
+            let h = max(Int(CGFloat(gridHeight) * scale), 1)
             if let ctx = CGContext(
                 data: nil, width: w, height: h,
                 bitsPerComponent: 8, bytesPerRow: 0,
@@ -904,6 +914,12 @@ public final class SimulationEngine {
                 ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
                 if let scaled = ctx.makeImage() { cgImage = scaled }
             }
+        }
+        if let spacing = gridSpacing, spacing >= 10 {
+            cgImage = SnapshotGrid.draw(
+                on: cgImage, spacingPt: spacing, scale: scale,
+                canvasSize: (gridWidth, gridHeight)
+            ) ?? cgImage
         }
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
@@ -920,6 +936,26 @@ public final class SimulationEngine {
     }
 
     // MARK: - 状態クエリ
+
+    /// 指定座標の表示色(sRGB 0...1)を返す。現フレームの合成を CPU に読み戻して拾う。
+    /// 「狙った色が出ているか」を目視でなく実測で確認するためのもの(MCP の sample_colors)。
+    public func sampleColors(at points: [SIMD2<Float>]) throws -> [SIMD3<Float>] {
+        let image = try renderFrameCGImage()
+        guard let data = image.dataProvider?.data as Data? else {
+            throw EngineError.pipelineFailed("sample pixels")
+        }
+        let bytesPerRow = image.bytesPerRow
+        return points.map { p in
+            let x = min(max(Int(p.x), 0), gridWidth - 1)
+            let y = min(max(Int(p.y), 0), gridHeight - 1)
+            let i = y * bytesPerRow + x * 4 // BGRA(byteOrder32Little + premultipliedFirst)
+            return SIMD3(
+                Float(data[i + 2]) / 255, // R
+                Float(data[i + 1]) / 255, // G
+                Float(data[i]) / 255      // B
+            )
+        }
+    }
 
     /// 濡れているセル(W > wetThreshold)の割合 0...1。「乾くまで待つ」用のヒューリスティック。
     /// waterA は storageModeShared なので CPU から直接読む。GPU が書き込み中の値を読む
