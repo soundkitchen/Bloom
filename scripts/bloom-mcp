@@ -1,0 +1,10 @@
+#!/bin/sh
+# Claude Code から spawn される MCP エントリポイント(.mcp.json 参照)。
+# ビルド済みの bloom-mcp ブリッジ(stdio ⇄ Unix ソケット)へ exec するだけ。
+# DerivedData のパスは Makefile が固定している(Bloom-cli)のでマシン内で安定。
+BRIDGE="$HOME/Library/Developer/Xcode/DerivedData/Bloom-cli/Build/Products/Debug/bloom-mcp"
+if [ ! -x "$BRIDGE" ]; then
+    echo "bloom-mcp: ブリッジが見つかりません($BRIDGE)。先に make build を実行してください" >&2
+    exit 1
+fi
+exec "$BRIDGE" "$@"

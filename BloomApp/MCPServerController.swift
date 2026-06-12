@@ -1,0 +1,136 @@
+import Foundation
+import MCP
+
+/// 1 接続ぶんの fd の持ち主。takeover(新規接続による横取り)からは shutdown だけを行い、
+/// close は serve 側の後始末に一本化する(fd 番号の再利用レースを避けるため)。
+@MainActor
+private final class MCPConnection {
+    let fd: Int32
+    init(fd: Int32) { self.fd = fd }
+    func shutdownNow() { shutdown(fd, SHUT_RDWR) }
+    func closeNow() { close(fd) }
+}
+
+/// アプリ内蔵の MCP サーバ。起動済みアプリの Unix ソケットに bloom-mcp(stdio ブリッジ)が
+/// 接続し、エージェントはユーザーが見ているキャンバスをライブに操作する。
+///
+/// - フレーミングは自作の MCPSocketTransport(改行区切り JSON-RPC・単一ライター)。
+///   SDK の StdioTransport は actor 再入で大きな応答が混線するため使わない(同ファイル参照)
+/// - 接続ごとに新しい Server を作り、切断(waitUntilCompleted)まで面倒を見る
+/// - **newest-wins**: 新しい接続が来たら旧接続を shutdown して新しい方を生かす。
+///   死んだセッションのブリッジがスロットを握り続けて新セッションが繋がらない事態を防ぐ
+/// - ツールの実体はすべて @MainActor(MCPTools.swift)。SDK のハンドラから await で hop する
+@MainActor
+final class MCPServerController {
+    private weak var canvas: CanvasView?
+    private var listener: MCPSocketListener?
+    private var acceptTask: Task<Void, Never>?
+    private var currentConnection: MCPConnection?
+
+    /// ステータスバー表示用("待機中" / "接続中" / 無効理由)
+    var onStatusChanged: ((String) -> Void)?
+
+    init(canvas: CanvasView) {
+        self.canvas = canvas
+    }
+
+    func start() {
+        do {
+            let listener = try MCPSocketListener(path: MCPSocketListener.socketPath())
+            self.listener = listener
+            onStatusChanged?("MCP: 待機中")
+            acceptTask = Task { [weak self] in
+                for await fd in listener.connections {
+                    guard let self else {
+                        close(fd)
+                        return
+                    }
+                    // newest-wins: 旧接続は EOF にして畳ませ、新しい接続を生かす
+                    self.currentConnection?.shutdownNow()
+                    let connection = MCPConnection(fd: fd)
+                    self.currentConnection = connection
+                    Task { [weak self] in await self?.serve(connection) }
+                }
+            }
+        } catch MCPSocketListener.ListenerError.anotherInstance {
+            onStatusChanged?("MCP: 無効(別の Bloom が待機中)")
+        } catch {
+            onStatusChanged?("MCP: 無効(\(error.localizedDescription))")
+        }
+    }
+
+    func stop() {
+        acceptTask?.cancel()
+        currentConnection?.shutdownNow()
+        listener?.shutdown()
+        listener = nil
+    }
+
+    /// 1 接続 = 1 セッション。切断まで面倒を見る
+    private func serve(_ connection: MCPConnection) async {
+        onStatusChanged?("MCP: 接続中")
+        let transport = MCPSocketTransport(fd: connection.fd)
+        let server = Server(
+            name: "Bloom",
+            version: "0.1.0",
+            instructions: """
+            Bloom は水彩・水墨の滲みシミュレーションで絵を描く macOS アプリ。\
+            このサーバはユーザーがいま開いているキャンバスをそのまま操作する(描く様子はライブで見える)。\
+            座標は原点左上・y 下向き・単位 pt。キャンバス寸法は get_canvas_info で確認すること。
+
+            ## ワークフロー(重要)
+            - draw_strokes は毎回、描画直後の縮小プレビュー画像を返す。**プレビューを見て位置・形・濃さを確認し、\
+            外したら undo してやり直す**(undo 履歴は 15 件。こまめに確認するほど安全に戻れる)
+            - **プレビューはウェット状態で、乾くと大幅に薄まる。** 仕上がりの色は dry_now(乾燥の早送り)してから \
+            snapshot / sample_colors で確認する。にじみを最大限育てたい層だけ wait_for_dry(自然乾燥)を使う
+            - **明 → 暗の順で全面に積む。** 最初に全面を淡い色で下塗りし、中間調 → 濃色アクセント・輪郭の順。\
+            先に濃い色で塗り分けると後から薄められず、境界に白い隙間や硬い分離が残る
+            - 層を重ねる前には必ず乾かす(dry_now)。乾く前に重ねると混ざる(意図的なら可)
+            - 形は少数の制御点(5〜10 点)で指定すればよい。スプライン補間でなめらかになる
+            - **目測より計測**: 位置のずれは snapshot {grid: true}(100pt 目盛り)で座標を特定し、\
+            色は sample_colors で実測してから直す
+
+            ## 画材レシピ
+            - **広いウォッシュ(空・水面・背景)**: preset watercolor / radius 30〜45 / water 0.85〜0.95 / \
+            pigment 0.10〜0.20 / pressure 0.4〜0.6。にじみが広がって面になる
+            - **濃くはっきりした形**: watercolor で pigment 0.5〜0.75(乾燥で薄まるぶん強めに)。\
+            さらに精密な線・輪郭は preset sumi(水が少なくにじまないので形がそのまま残る)
+            - **かすれた払い(草・枝・尾)**: preset sumi + pressure_profile "exit"。筆圧が抜けてかすれが育つ
+            - **入り抜きのある筆致**: pressure_profile "taper"(両端が細い)
+            - **色を重ねる**: 減法混色で濃くなる。乾く前に隣接させると混ざり合い、乾いてからだと硬いエッジが残る\
+            (どちらも水彩の味)
+            - 水彩はにじんで輪郭が崩れるのが仕様。崩れて困る形には sumi を使うこと
+            """,
+            capabilities: .init(tools: .init(listChanged: false))
+        )
+        _ = await server.withMethodHandler(ListTools.self) { _ in
+            .init(tools: BloomMCPTools.all)
+        }
+        _ = await server.withMethodHandler(CallTool.self) { [weak self] params in
+            guard let self else { throw MCPError.internalError("アプリが終了中です") }
+            return try await self.callTool(name: params.name, arguments: params.arguments ?? [:])
+        }
+        do {
+            try await server.start(transport: transport)
+            await server.waitUntilCompleted()
+        } catch {
+            // 接続確立に失敗しただけなので待機に戻る
+        }
+        await server.stop()
+        connection.closeNow()
+        if currentConnection === connection {
+            currentConnection = nil
+            onStatusChanged?("MCP: 待機中")
+        }
+    }
+
+    private func callTool(name: String, arguments: [String: Value]) async throws -> CallTool.Result {
+        guard let canvas, let engine = canvas.engine else {
+            throw MCPError.internalError("キャンバスが初期化されていません")
+        }
+        guard let tool = BloomMCPTools.Name(rawValue: name) else {
+            throw MCPError.invalidParams("不明なツール: \(name)")
+        }
+        return try await BloomMCPTools.handle(tool: tool, arguments: arguments, canvas: canvas, engine: engine)
+    }
+}
