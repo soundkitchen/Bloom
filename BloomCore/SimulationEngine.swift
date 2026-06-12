@@ -885,9 +885,26 @@ public final class SimulationEngine {
         return cgImage
     }
 
-    /// 現フレームをグリッド等倍の PNG データにする(ファイル書き出し・スナップショット返却で共用)。
-    public func makePNGData() throws -> Data {
-        let cgImage = try renderFrameCGImage()
+    /// 現フレームを PNG データにする(ファイル書き出し・スナップショット返却で共用)。
+    /// maxDimension を指定すると長辺がその値になるよう縮小する(プレビュー用)。
+    public func makePNGData(maxDimension: Int? = nil) throws -> Data {
+        var cgImage = try renderFrameCGImage()
+        if let maxDim = maxDimension, maxDim >= 8, max(gridWidth, gridHeight) > maxDim {
+            let scale = Float(maxDim) / Float(max(gridWidth, gridHeight))
+            let w = max(Int(Float(gridWidth) * scale), 1)
+            let h = max(Int(Float(gridHeight) * scale), 1)
+            if let ctx = CGContext(
+                data: nil, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue
+            ) {
+                ctx.interpolationQuality = .high
+                ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+                if let scaled = ctx.makeImage() { cgImage = scaled }
+            }
+        }
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
             data as CFMutableData, UTType.png.identifier as CFString, 1, nil

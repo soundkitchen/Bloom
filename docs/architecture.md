@@ -175,6 +175,11 @@ Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPT
 - **並行性**: ツール実装は全部 `@MainActor`(`MCPTools`)。SDK のハンドラから `await` で hop する。`draw_strokes` / `wait_for_dry` は `Task.sleep` を挟むので main はブロックされず、MTKView の描画(= シミュレーション進行)は止まらない
 - **UI 同期**: undo/redo・ブラシ変更は `CanvasView` のラッパー(`undo()` / `selectBrush(_:)`)経由で呼び、インスペクタ・タイムラインが既存経路で追従する。ストロークだけ engine 直(`beginStroke`/`addStrokeSample`/`endStroke`、スタビライザは通さない — 入力節参照)。MCP 描画中は `CanvasView.isExternallyDrawing` でユーザーのマウス入力をガード(ストローク状態の混線防止)
 - **ペーシング**: `draw_strokes` はサンプルを 3 点ずつ投入して 8ms 待つ。一括投入だと `maxStampsPerFrame`(1024)超過分が黙って捨てられるため。副産物として「線が生えていく」ライブ感が出る
+- **エージェントの描画精度のための工夫**(LLM は生の座標列の空間推論が苦手なので、その弱点を吸収する):
+  - **スプライン補間**(`BloomCore/StrokePath`・Catmull-Rom): 制御点 5〜10 個で形を指定すれば約 2.5pt 間隔の点列に補間される(`smooth: false` で無効化可)。筆圧は制御点間で線形補間
+  - **入り抜きプロファイル**(`pressure_profile`): flat / taper(両端細)/ entry(入り細)/ exit(払い)を正規化弧長で筆圧に乗算
+  - **描画結果の自動返却**: `draw_strokes` の結果に描画直後の縮小プレビュー(長辺 400px・`makePNGData(maxDimension:)`)を毎回添付し、「描く → 見る → 外したら undo」のループを強制的に閉じる
+  - **画材レシピの注入**: サーバの `instructions` にウォッシュ/精密な線/かすれ払い等のパラメータレシピとワークフロー指針を記載
 - **乾燥待ち**: `wait_for_dry` は `SimulationEngine.wetFraction`(W バッファの CPU 走査・shared なので安価)を 250ms 間隔でポーリング。**ウィンドウが隠れると MTKView が止まりシミュレーションも進まない**ので、タイムアウト時はその旨のヒントを返す
 - **無効化**: `--no-mcp` で起動。`--demo` 系の検証モードではそもそも起動しない
 
@@ -184,7 +189,7 @@ Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPT
 |---|---|
 | `get_canvas_info` | 寸法(原点左上・y 下向き・pt)・ブラシ・レイヤー・フレーム・wet_fraction・undo 可否を JSON で |
 | `set_brush` | preset(watercolor/sumi)+ color/radius/water/pigment/dryness の永続変更(インスペクタ追従) |
-| `draw_strokes` | 複数ストローク(points[]{x,y,pressure})。ストローク単位の一時ブラシ上書き可。1 ストローク = 1 undo 単位 |
+| `draw_strokes` | 複数ストローク(points[]{x,y,pressure})。制御点はスプライン補間され、`pressure_profile` で入り抜き。ストローク単位の一時ブラシ上書き可。1 ストローク = 1 undo 単位。結果に縮小プレビュー画像が付く |
 | `wait_for_dry` | 乾くまで待つ(`timeout_seconds`、既定 15 秒) |
 | `snapshot` | 現フレームを base64 PNG(image content)で返す |
 | `clear` / `undo` / `redo` | クリア(undo 可)・取り消し・やり直し |

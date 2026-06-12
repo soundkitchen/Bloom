@@ -43,6 +43,17 @@ final class MCPSupportTests: XCTestCase {
         XCTAssertEqual(img.height, 64)
     }
 
+    func testMakePNGDataMaxDimensionScalesDown() throws {
+        let e = try SimulationEngine(width: 96, height: 64)
+        let data = try e.makePNGData(maxDimension: 48)
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return XCTFail("PNG としてデコードできること")
+        }
+        XCTAssertEqual(img.width, 48, "長辺が maxDimension に縮むこと")
+        XCTAssertEqual(img.height, 32, "アスペクト比が保たれること")
+    }
+
     func testWetFractionRisesWithStrokeAndFallsWithClear() throws {
         let e = try SimulationEngine(width: 64, height: 64)
         XCTAssertEqual(e.wetFraction, 0, "初期状態は乾いている")

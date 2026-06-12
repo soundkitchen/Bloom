@@ -72,9 +72,11 @@ enum BloomMCPTools {
         Tool(
             name: Name.drawStrokes.rawValue,
             description: "キャンバスにストロークを描く。座標は原点左上・y 下向き・単位 pt(キャンバス外はクランプ)。"
+                + "点列はスプライン補間されるので、形は少数の制御点(5〜10 点)で指定すればよい。"
+                + "pressure は太さ・水量・かすれに効き、pressure_profile で入り抜きを付けられる。"
+                + "結果には描画直後の縮小プレビュー画像が付く(ウェット状態。乾くと薄まりエッジが締まる)。"
                 + "ユーザーが見ているキャンバスにライブで描かれ、水彩は描いた後も滲み続けて数秒で乾く。"
-                + "1 ストローク = 1 undo 単位(履歴は直近 15 件まで)。"
-                + "点列は密(数 pt 間隔)に与えると筆致がなめらかになる。pressure は太さ・水量・かすれに効く。",
+                + "1 ストローク = 1 undo 単位(履歴は直近 15 件まで)。",
             inputSchema: [
                 "type": "object",
                 "required": ["strokes"],
@@ -103,6 +105,14 @@ enum BloomMCPTools {
                                 "pressure": [
                                     "type": "number", "minimum": 0, "maximum": 1,
                                     "description": "ストローク既定の筆圧(default 0.7)",
+                                ],
+                                "pressure_profile": [
+                                    "type": "string", "enum": ["flat", "taper", "entry", "exit"],
+                                    "description": "筆圧の入り抜き(各点の筆圧に乗算)。flat=そのまま(default)/ taper=入りと抜きの両方が細い / entry=入りが細い / exit=払い(終端へ抜ける)",
+                                ],
+                                "smooth": [
+                                    "type": "boolean",
+                                    "description": "制御点を Catmull-Rom スプラインで補間してなめらかな曲線にする(default true)。折れ線をそのまま描きたいときだけ false",
                                 ],
                                 "brush": [
                                     "type": "object",
@@ -205,9 +215,32 @@ enum BloomMCPTools {
     // MARK: - draw_strokes
 
     private struct ParsedStroke {
-        var samples: [(position: SIMD2<Float>, pressure: Float)]
+        var samples: [InputSample]
         var brush: SimulationEngine.Brush?
     }
+
+    /// 筆圧の入り抜き。正規化弧長 t(0...1)での係数を各点の筆圧に乗算する
+    private enum PressureProfile: String {
+        case flat, taper, entry, exit
+
+        func factor(at t: Float) -> Float {
+            switch self {
+            case .flat: return 1
+            case .taper: return Self.ramp(0, 0.25, t) * (1 - Self.ramp(0.7, 1, t))
+            case .entry: return Self.ramp(0, 0.35, t)
+            case .exit: return 1 - Self.ramp(0.55, 1, t)
+            }
+        }
+
+        private static func ramp(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
+            let t = simd_clamp((x - e0) / (e1 - e0), 0, 1)
+            return t * t * (3 - 2 * t) // smoothstep
+        }
+    }
+
+    /// スプライン補間の点間隔(pt)とストローク 1 本あたりの補間後サンプル上限
+    private static let interpolationSpacing: Float = 2.5
+    private static let maxSamplesPerStroke = 5000
 
     private static func drawStrokes(
         arguments: [String: Value], canvas: CanvasView, engine: SimulationEngine
@@ -234,7 +267,15 @@ enum BloomMCPTools {
                 throw MCPError.invalidParams("strokes[\(i)].points は最大 2000 点です")
             }
             let basePressure = number(stroke["pressure"]).map { simd_clamp($0, 0, 1) } ?? 0.7
-            var samples: [(SIMD2<Float>, Float)] = []
+            var profile = PressureProfile.flat
+            if let profileName = stroke["pressure_profile"]?.stringValue {
+                guard let p = PressureProfile(rawValue: profileName) else {
+                    throw MCPError.invalidParams("strokes[\(i)].pressure_profile は flat / taper / entry / exit です: \(profileName)")
+                }
+                profile = p
+            }
+            let smooth = stroke["smooth"]?.boolValue ?? true
+            var samples: [InputSample] = []
             for (j, pointValue) in pointsValue.enumerated() {
                 guard let point = pointValue.objectValue,
                       let x = number(point["x"]), let y = number(point["y"]) else {
@@ -242,7 +283,25 @@ enum BloomMCPTools {
                 }
                 let position = SIMD2(simd_clamp(x, 0, w), simd_clamp(y, 0, h))
                 let pressure = number(point["pressure"]).map { simd_clamp($0, 0, 1) } ?? basePressure
-                samples.append((position, pressure))
+                samples.append(InputSample(position: position, pressure: pressure))
+            }
+
+            // 制御点 → スプライン補間 → 入り抜き適用 → 再クランプ(スプラインは制御点間で膨らみうる)
+            if smooth, samples.count > 1 {
+                samples = StrokePath.interpolate(samples, spacing: interpolationSpacing)
+            }
+            if samples.count > maxSamplesPerStroke {
+                let step = (samples.count + maxSamplesPerStroke - 1) / maxSamplesPerStroke
+                samples = stride(from: 0, to: samples.count, by: step).map { samples[$0] }
+            }
+            let count = samples.count
+            for k in 0..<count {
+                let t = count > 1 ? Float(k) / Float(count - 1) : 1
+                samples[k].pressure = simd_clamp(samples[k].pressure * profile.factor(at: t), 0, 1)
+                samples[k].position = SIMD2(
+                    simd_clamp(samples[k].position.x, 0, w),
+                    simd_clamp(samples[k].position.y, 0, h)
+                )
             }
             let brush = try stroke["brush"]?.objectValue.map { try parseBrush($0, base: engine.brush) }
             parsed.append(ParsedStroke(samples: samples, brush: brush))
@@ -273,10 +332,17 @@ enum BloomMCPTools {
         }
         let elapsed = started.duration(to: .now)
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) * 1e-18
-        return .init(content: [textContent(
+
+        // 描いた直後の縮小プレビューを毎回返す(描く → 見る → 直すのループを閉じる)
+        var content: [Tool.Content] = [textContent(
             "\(parsed.count) ストローク・\(totalSamples) サンプルを描画しました(\(String(format: "%.1f", seconds)) 秒)。"
-                + "wet_fraction=\(rounded(engine.wetFraction))(滲み・乾燥は進行中)"
-        )])
+                + "wet_fraction=\(rounded(engine.wetFraction))。"
+                + "下はウェット直後の縮小プレビュー(乾くと薄まりエッジが締まる。仕上がりは wait_for_dry → snapshot で確認)"
+        )]
+        if let preview = try? engine.makePNGData(maxDimension: 400) {
+            content.append(imageContent(base64: preview.base64EncodedString(), mimeType: "image/png"))
+        }
+        return .init(content: content)
     }
 
     // MARK: - wait_for_dry

@@ -84,6 +84,30 @@ Claude Code ── stdio ── bloom-mcp(ブリッジ)── Unix ソケット 
 - E2E: ブリッジ経由で「水彩の波線 + 墨の払い(一時ブラシ上書き)を draw_strokes → wait_for_dry →
   snapshot」を実行。返ってきた PNG にエッジダークニング付きの波線とかすれた払いが写っていることを目視確認
 
+## 追記: 描画精度の改善(同日)
+
+実機テストで「エージェントの描く絵の精度が低い」というフィードバック。原因は MCP の不具合ではなく
+**エージェントが目隠しで生の座標列を打っている**こと(LLM はピクセル座標の空間推論が苦手で、
+描いた結果も見ていない)。3 点を同ブランチで追加実装した:
+
+1. **描画結果の自動返却** — `draw_strokes` の結果に描画直後の縮小プレビュー
+   (長辺 400px・`makePNGData(maxDimension:)` を新設)を毎回添付。
+   「描く → 見る → 外したら undo」のループが強制的に閉じる
+2. **スプライン補間 + 入り抜き** — `BloomCore/StrokePath`(Catmull-Rom・uniform)を新設し、
+   制御点 5〜10 個 → 約 2.5pt 間隔の点列に補間(`smooth: false` で無効化可)。
+   `pressure_profile`(flat/taper/entry/exit)を正規化弧長で筆圧に乗算。
+   80 点必要だった波線が制御点 6 個で描けるようになり、形の破綻も減る
+3. **画材レシピの注入** — サーバ `instructions` にウォッシュ/精密な線(sumi)/かすれ払い
+   (sumi + exit)等のパラメータレシピと、「大きい要素から先に・こまめにプレビュー確認・
+   水彩のにじみは仕様」というワークフロー指針を記載
+
+Catmull-Rom の実装では多項式をひとつの式に書くと Swift の型推論が
+`unable to type-check this expression in reasonable time` で破綻するため、項ごとに分割 +
+明示的な `Float()` で逃した(SIMD2 と整数リテラル混在の演算子チェーンは要注意)。
+
+検証: テスト 51 件 pass(StrokePath 5 + 縮小 PNG 1 を追加)。E2E で「制御点 6 個 + taper の波線、
+4 個 + exit の墨の払い」を描き、なめらかな曲線・末端のかすれ・プレビュー自動添付を目視確認。
+
 ## 次(M4 残り)
 
 - ⬜ Phase 2: `manage_layer` / `manage_frame` / `save_document` / `load_document`
