@@ -79,11 +79,14 @@ guard let sock = connectWithRetry(path: socketPath) else {
 }
 log("接続しました: \(socketPath)")
 
-// どちらかの方向が閉じたら全体を畳む(片側 EOF = セッション終了)
+// half-close を正しく扱う:
+// - stdin EOF(クライアント終了)では書き込み側だけ shutdown し、サーバからの
+//   送信途中の応答は最後まで stdout へ流し切る(即死すると応答が欠ける)
+// - socket EOF(サーバ切断)で全体を畳む
 let done = DispatchSemaphore(value: 0)
 Thread.detachNewThread {
     pump(from: 0, to: sock) // stdin → socket
-    done.signal()
+    shutdown(sock, SHUT_WR) // サーバに EOF を伝える(読み取りは続行)
 }
 Thread.detachNewThread {
     pump(from: sock, to: 1) // socket → stdout

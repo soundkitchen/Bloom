@@ -47,5 +47,9 @@ grep -q '"serverInfo"' "$OUT" || fail "initialize の応答がありません"
 grep -q '"draw_strokes"' "$OUT" || fail "tools/list に draw_strokes がありません"
 grep -q 'wet_fraction' "$OUT" || fail "get_canvas_info の応答がありません"
 
+# 並列ツール呼び出し + 背圧での送信混線検査(再接続の検証も兼ねる)
+BLOOM_MCP_SOCKET="$SOCK" python3 "$(dirname "$0")/mcp-parallel-smoke.py" "$BRIDGE" \
+    || fail "並列・背圧の混線検査(mcp-parallel-smoke.py)"
+
 cleanup
-echo "OK: initialize / tools/list / tools/call(get_canvas_info) すべて応答"
+echo "OK: initialize / tools/list / tools/call / 並列混線検査 すべてパス"

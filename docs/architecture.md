@@ -166,12 +166,12 @@ Claude Code ──(stdio: 改行区切り JSON-RPC)── bloom-mcp(ブリッジ
                                                 │ バイトをそのまま双方向ポンプ(フレーミングも解釈しない)
                   ~/Library/Application Support/Bloom/mcp.sock(0600・BLOOM_MCP_SOCKET で上書き可)
                                                 │
-Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPTools ── CanvasView / SimulationEngine
-              └ swift-sdk の StdioTransport を接続済みソケット fd に被せて流用(カスタム Transport 不要)
+Bloom.app ── MCPSocketListener(accept)── MCPSocketTransport ── MCPServerController ── MCPTools ── CanvasView / Engine
 ```
 
-- **プロトコル処理は 100% アプリ内**(公式 [swift-sdk](https://github.com/modelcontextprotocol/swift-sdk)。0.x のため `project.yml` で exact 固定)。ブリッジ(`BloomMCPBridge/`)は stdin/stdout ⇄ ソケットの素通しポンプで、SDK にも BloomCore にも依存しない。診断は stderr のみ(stdout はプロトコル専用)
-- **接続ライフサイクル**: 接続ごとに新しい `Server` を作り `waitUntilCompleted` で切断まで面倒を見る(再接続可)。同時 2 本目は即 close(単一クライアント)。アプリ起動時に残骸ソケットがあれば接続プローブで判定し、拒否されたら unlink、生きていたら(別インスタンス)MCP を無効化してステータスバーに表示
+- **プロトコル処理は 100% アプリ内**(公式 [swift-sdk](https://github.com/modelcontextprotocol/swift-sdk)。0.x のため `project.yml` で exact 固定)。ブリッジ(`BloomMCPBridge/`)は stdin/stdout ⇄ ソケットの素通しポンプで、SDK にも BloomCore にも依存しない。診断は stderr のみ(stdout はプロトコル専用)。stdin EOF では書き込み側だけ shutdown し、送信途中の応答を流し切ってから畳む(half-close 対応)
+- **トランスポートは自作の `MCPSocketTransport`**(改行区切り JSON-RPC)。SDK の StdioTransport を fd に被せて流用**してはいけない**: その send は EAGAIN 時に `await Task.sleep` で待つが、actor は suspension 中に再入可能なため、巨大応答(snapshot は 1 行 ~840KB)の書き込み途中に別ハンドラの send が割り込んで**バイト列が混線**する(並列ツール呼び出しで実発生 → クライアントが壊れた JSON を読み捨て、応答が永遠に届かない)。自作版は send をキューに積み、**単一のドレインループ**だけが fd へ書くことでメッセージ単位の原子性を保証する
+- **接続ライフサイクル**: 接続ごとに新しい `Server` を作り `waitUntilCompleted` で切断まで面倒を見る。**newest-wins**: 新しい接続が来たら旧接続を shutdown して新しい方を生かす(死んだセッションのブリッジがスロットを握り続けて新セッションが繋がらない事態を防ぐ。takeover は shutdown のみ・close は serve 側に一本化して fd 再利用レースを回避)。アプリ起動時に残骸ソケットがあれば接続プローブで判定し、拒否されたら unlink、生きていたら(別インスタンス)MCP を無効化してステータスバーに表示
 - **並行性**: ツール実装は全部 `@MainActor`(`MCPTools`)。SDK のハンドラから `await` で hop する。`draw_strokes` / `wait_for_dry` は `Task.sleep` を挟むので main はブロックされず、MTKView の描画(= シミュレーション進行)は止まらない
 - **UI 同期**: undo/redo・ブラシ変更は `CanvasView` のラッパー(`undo()` / `selectBrush(_:)`)経由で呼び、インスペクタ・タイムラインが既存経路で追従する。ストロークだけ engine 直(`beginStroke`/`addStrokeSample`/`endStroke`、スタビライザは通さない — 入力節参照)。MCP 描画中は `CanvasView.isExternallyDrawing` でユーザーのマウス入力をガード(ストローク状態の混線防止)
 - **ペーシング**: `draw_strokes` はサンプルを 3 点ずつ投入して 8ms 待つ。一括投入だと `maxStampsPerFrame`(1024)超過分が黙って捨てられるため。副産物として「線が生えていく」ライブ感が出る
@@ -203,7 +203,7 @@ Phase 3(予定): `export`(PNG/GIF/MP4/スプライト/連番)・`snapshot(frame:
 ### 登録と検証
 
 - リポジトリの `.mcp.json`(プロジェクトスコープ)が `scripts/bloom-mcp`(ビルド済みブリッジへの sh ラッパー)を指す。このリポジトリで Claude Code を開けばサーバ「bloom」が自動認識される(要承認・要 `make build` + アプリ起動)
-- `make mcp-smoke` で Claude なしの疎通テスト(専用ソケットでアプリを起動 → initialize / tools/list / tools/call を流して応答検証 → 後始末)
+- `make mcp-smoke` で Claude なしの疎通テスト(専用ソケットでアプリを起動 → initialize / tools/list / tools/call を流して応答検証 → 後始末)。`scripts/mcp-parallel-smoke.py` による**並列ツール呼び出し + 背圧の混線検査**(snapshot 2 連発を読まずに放置 → 全行が JSON として無傷で届くこと)も含む
 
 ## ビルド構成
 

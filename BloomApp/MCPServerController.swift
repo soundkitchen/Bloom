@@ -1,20 +1,31 @@
 import Foundation
-import System
 import MCP
+
+/// 1 接続ぶんの fd の持ち主。takeover(新規接続による横取り)からは shutdown だけを行い、
+/// close は serve 側の後始末に一本化する(fd 番号の再利用レースを避けるため)。
+@MainActor
+private final class MCPConnection {
+    let fd: Int32
+    init(fd: Int32) { self.fd = fd }
+    func shutdownNow() { shutdown(fd, SHUT_RDWR) }
+    func closeNow() { close(fd) }
+}
 
 /// アプリ内蔵の MCP サーバ。起動済みアプリの Unix ソケットに bloom-mcp(stdio ブリッジ)が
 /// 接続し、エージェントはユーザーが見ているキャンバスをライブに操作する。
 ///
-/// - フレーミングは SDK の StdioTransport を接続済みソケット fd に被せて流用する
-///   (StdioTransport は任意の fd ペアで動く改行区切り JSON-RPC。カスタム Transport 不要)
-/// - 接続ごとに新しい Server を作り、切断(waitUntilCompleted)後に次を受ける
+/// - フレーミングは自作の MCPSocketTransport(改行区切り JSON-RPC・単一ライター)。
+///   SDK の StdioTransport は actor 再入で大きな応答が混線するため使わない(同ファイル参照)
+/// - 接続ごとに新しい Server を作り、切断(waitUntilCompleted)まで面倒を見る
+/// - **newest-wins**: 新しい接続が来たら旧接続を shutdown して新しい方を生かす。
+///   死んだセッションのブリッジがスロットを握り続けて新セッションが繋がらない事態を防ぐ
 /// - ツールの実体はすべて @MainActor(MCPTools.swift)。SDK のハンドラから await で hop する
 @MainActor
 final class MCPServerController {
     private weak var canvas: CanvasView?
     private var listener: MCPSocketListener?
     private var acceptTask: Task<Void, Never>?
-    private var isServing = false
+    private var currentConnection: MCPConnection?
 
     /// ステータスバー表示用("待機中" / "接続中" / 無効理由)
     var onStatusChanged: ((String) -> Void)?
@@ -34,17 +45,11 @@ final class MCPServerController {
                         close(fd)
                         return
                     }
-                    // 同時 1 クライアント。2 本目は即 close(ブリッジ側は EOF で終了する)
-                    if self.isServing {
-                        close(fd)
-                        continue
-                    }
-                    self.isServing = true
-                    Task { [weak self] in
-                        await self?.serve(fd: fd)
-                        self?.isServing = false
-                        self?.onStatusChanged?("MCP: 待機中")
-                    }
+                    // newest-wins: 旧接続は EOF にして畳ませ、新しい接続を生かす
+                    self.currentConnection?.shutdownNow()
+                    let connection = MCPConnection(fd: fd)
+                    self.currentConnection = connection
+                    Task { [weak self] in await self?.serve(connection) }
                 }
             }
         } catch MCPSocketListener.ListenerError.anotherInstance {
@@ -56,17 +61,15 @@ final class MCPServerController {
 
     func stop() {
         acceptTask?.cancel()
+        currentConnection?.shutdownNow()
         listener?.shutdown()
         listener = nil
     }
 
     /// 1 接続 = 1 セッション。切断まで面倒を見る
-    private func serve(fd: Int32) async {
+    private func serve(_ connection: MCPConnection) async {
         onStatusChanged?("MCP: 接続中")
-        let transport = StdioTransport(
-            input: FileDescriptor(rawValue: fd),
-            output: FileDescriptor(rawValue: fd)
-        )
+        let transport = MCPSocketTransport(fd: connection.fd)
         let server = Server(
             name: "Bloom",
             version: "0.1.0",
@@ -114,7 +117,11 @@ final class MCPServerController {
             // 接続確立に失敗しただけなので待機に戻る
         }
         await server.stop()
-        close(fd)
+        connection.closeNow()
+        if currentConnection === connection {
+            currentConnection = nil
+            onStatusChanged?("MCP: 待機中")
+        }
     }
 
     private func callTool(name: String, arguments: [String: Value]) async throws -> CallTool.Result {
