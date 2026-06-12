@@ -41,6 +41,9 @@ final class CanvasView: MTKView {
     var onTimelineChanged: (() -> Void)?
     var isPlaying = false
 
+    /// MCP 経由の描画中はユーザー入力を受けない(エンジンのストローク状態が単一で混線するため)
+    var isExternallyDrawing = false
+
     var frameTotal: Int { engine?.frameTotal ?? 1 }
     var currentFrameIndex: Int { engine?.currentFrameIndex ?? 0 }
     var onionEnabled: Bool { engine?.onionEnabled ?? false }
@@ -91,7 +94,7 @@ final class CanvasView: MTKView {
     // MARK: - 入力
 
     override func mouseDown(with event: NSEvent) {
-        guard !isPlaying else { return } // 再生中は描かない
+        guard !isPlaying, !isExternallyDrawing else { return } // 再生中・MCP 描画中は描かない
         pressureEstimator.reset()
         stabilizer.strength = stabilizeStrength
         stabilizer.reset(at: gridPoint(from: event))
@@ -100,12 +103,12 @@ final class CanvasView: MTKView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !isPlaying else { return }
+        guard !isPlaying, !isExternallyDrawing else { return }
         addSample(from: event)
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard !isPlaying else { return }
+        guard !isPlaying, !isExternallyDrawing else { return }
         // プル方式は出力が遅れるので、実終点まで補完してから筆を上げる(線を届かせる)
         for p in stabilizer.flush(to: lastRawPoint) {
             engine?.addStrokeSample(at: p, pressure: lastPressure)

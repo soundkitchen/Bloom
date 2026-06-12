@@ -17,9 +17,10 @@
 `Bloom.xcodeproj` は XcodeGen の生成物(git 管理外)。`project.yml` を編集したら `make gen`。
 
 ```sh
-make run    # アプリ起動
-make test   # ユニットテスト
-make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dry PNG を出力
+make run        # アプリ起動
+make test       # ユニットテスト
+make demo       # デモストロークを自動実行し /tmp/bloom-snap に wet/dry PNG を出力
+make mcp-smoke  # MCP サーバの疎通テスト
 ```
 
 ## アプリ内の操作
@@ -33,11 +34,13 @@ make demo   # デモストロークを自動実行し /tmp/bloom-snap に wet/dr
 - **取り消し / やり直し**: Cmd+Z / Cmd+Shift+Z
 - **アニメーション**(下のタイムライン): フレーム選択・追加/複製/削除、再生 ▶、前後送り、オニオン(前フレームを薄く表示)、fps。フレームメニュー(新規 Cmd+Shift+N など)
 - **保存 / 書き出し**(ファイルメニュー): 開く Cmd+O / 保存 Cmd+S(`.bloom`)/ PNG Cmd+E / GIF Cmd+G / スプライトシート Cmd+Shift+G / PNG 連番
+- **AI と一緒に描く(MCP)**: アプリを起動したままこのリポジトリで Claude Code を開くと、エージェントがキャンバスにライブで描ける([guide.md の MCP 節](docs/guide.md#8-ai-と一緒に描くmcp))
 
 詳細は [docs/architecture.md](docs/architecture.md) を参照。
 
 ## 構成
 
 - `BloomCore/` — ヘッドレスの描画コア(framework、AppKit 非依存)。滲みシミュレーション + レイヤー/フレーム(`SimulationEngine`)、Metal カーネル(`Simulation.metal`)、書き出し(`AnimationExport`)、入力抽象 + 擬似筆圧(`InputSample`)、手ブレ補正(`StrokeStabilizer`)
-- `BloomApp/` — macOS アプリ。`CanvasView` / `InspectorView` / `TimelineView` / `AppDelegate`
+- `BloomApp/` — macOS アプリ。`CanvasView` / `InspectorView` / `TimelineView` / `AppDelegate` + アプリ内蔵 MCP サーバ(`MCPServerController` / `MCPSocketListener` / `MCPTools`)
+- `BloomMCPBridge/` — `bloom-mcp`(Claude Code から spawn される stdio ⇄ Unix ソケットのブリッジ CLI)
 - `BloomCoreTests/` — コアのユニットテスト

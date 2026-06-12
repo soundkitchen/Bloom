@@ -885,14 +885,34 @@ public final class SimulationEngine {
         return cgImage
     }
 
-    /// 現フレームをグリッド等倍で PNG に書き出す。
-    public func savePNG(to url: URL) throws {
+    /// 現フレームをグリッド等倍の PNG データにする(ファイル書き出し・スナップショット返却で共用)。
+    public func makePNGData() throws -> Data {
         let cgImage = try renderFrameCGImage()
-        guard let dest = CGImageDestinationCreateWithURL(
-            url as CFURL, UTType.png.identifier as CFString, 1, nil
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData, UTType.png.identifier as CFString, 1, nil
         ) else { throw EngineError.pipelineFailed("png export") }
         CGImageDestinationAddImage(dest, cgImage, nil)
         guard CGImageDestinationFinalize(dest) else { throw EngineError.pipelineFailed("png finalize") }
+        return data as Data
+    }
+
+    /// 現フレームをグリッド等倍で PNG に書き出す。
+    public func savePNG(to url: URL) throws {
+        try makePNGData().write(to: url)
+    }
+
+    // MARK: - 状態クエリ
+
+    /// 濡れているセル(W > wetThreshold)の割合 0...1。「乾くまで待つ」用のヒューリスティック。
+    /// waterA は storageModeShared なので CPU から直接読む。GPU が書き込み中の値を読む
+    /// 可能性はあるが、乾燥の進み具合の目安としては十分。
+    public var wetFraction: Float {
+        let cellCount = gridWidth * gridHeight
+        let ptr = waterA.contents().bindMemory(to: Float.self, capacity: cellCount)
+        var wet = 0
+        for i in 0..<cellCount where ptr[i] > params.wetThreshold { wet += 1 }
+        return Float(wet) / Float(cellCount)
     }
 
     // MARK: - 内部

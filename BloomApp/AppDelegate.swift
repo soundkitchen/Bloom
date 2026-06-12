@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var inspector: InspectorView?
     private var timeline: TimelineView?
     private var statusLabel: NSTextField?
+    private var mcpStatusLabel: NSTextField?
+    private var mcpServer: MCPServerController?
     private var documentURL: URL?
     private var playTimer: Timer?
     private var playFps: Double = 12
@@ -117,6 +119,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let brush = canvas.currentBrush { canvas.selectBrush(brush) } // 初期状態を UI に反映
         inspector.reflectLayers(canvas.layerInfos, activeRow: canvas.activeLayerRow)
         refreshTimeline()
+
+        // MCP サーバ(通常起動では常時オン。--no-mcp で無効化)
+        if !CommandLine.arguments.contains("--no-mcp") {
+            let server = MCPServerController(canvas: canvas)
+            server.onStatusChanged = { [weak self] in self?.mcpStatusLabel?.stringValue = $0 }
+            server.start()
+            self.mcpServer = server
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        mcpServer?.stop() // ソケットを閉じて unlink(残骸を残さない)
     }
 
     // MARK: - タイムライン / 再生
@@ -183,6 +197,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         label.autoresizingMask = [.width]
         bar.addSubview(label)
         self.statusLabel = label
+
+        // 右端: MCP 接続状態(待機中 / 接続中 / 無効)
+        let mcpWidth: CGFloat = 220
+        let mcpLabel = NSTextField(labelWithString: "")
+        mcpLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        mcpLabel.textColor = .tertiaryLabelColor
+        mcpLabel.alignment = .right
+        mcpLabel.frame = NSRect(x: width - mcpWidth - 10, y: 4, width: mcpWidth, height: 16)
+        mcpLabel.autoresizingMask = [.minXMargin]
+        bar.addSubview(mcpLabel)
+        self.mcpStatusLabel = mcpLabel
         return bar
     }
 

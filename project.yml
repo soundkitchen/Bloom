@@ -7,6 +7,12 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
+# MCP 公式 Swift SDK。0.x はマイナーでも breaking change があり得るため exact 固定
+packages:
+  MCP:
+    url: https://github.com/modelcontextprotocol/swift-sdk
+    exactVersion: 0.12.1
+
 settings:
   base:
     # 手元のマシンにアプリとしてインストールするため Apple Development 証明書で実署名。
@@ -30,7 +36,7 @@ targets:
     sources:
       - BloomCore
 
-  # macOS アプリ(コアの上の薄い殻)
+  # macOS アプリ(コアの上の薄い殻)。MCP サーバを内蔵(起動済みアプリに bloom-mcp が接続する)
   BloomApp:
     type: application
     platform: macOS
@@ -38,12 +44,20 @@ targets:
       - BloomApp
     dependencies:
       - target: BloomCore
+      - package: MCP
     info:
       path: BloomApp/Info.plist
       properties:
         CFBundleDisplayName: Bloom
         NSPrincipalClass: NSApplication
         NSHighResolutionCapable: true
+
+  # Claude Code が spawn する stdio ブリッジ(stdin/stdout ⇄ Unix ソケットの素通し。SDK 非依存)
+  bloom-mcp:
+    type: tool
+    platform: macOS
+    sources:
+      - BloomMCPBridge
 
   BloomCoreTests:
     type: bundle.unit-test
@@ -58,6 +72,7 @@ schemes:
     build:
       targets:
         BloomApp: all
+        bloom-mcp: all
         BloomCoreTests: [test]
     run:
       config: Debug

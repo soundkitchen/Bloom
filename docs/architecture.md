@@ -10,12 +10,16 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
   ├─ CanvasView        MTKView。入力 → コア API、毎フレーム描画
   ├─ InspectorView     右パネル(ブラシ設定 GUI、レイヤーリスト)
   ├─ TimelineView      下帯(フレーム選択・追加/複製/削除・再生・オニオン・fps)
+  ├─ MCPServerController / MCPSocketListener / MCPTools
+  │                    アプリ内蔵 MCP サーバ(swift-sdk・Unix ソケット待ち受け)→「MCP サーバ」節
   └─ BloomCore(.framework / AppKit 非依存)─ 本体
        ├─ SimulationEngine   滲みシミュレーション + レイヤー/フレーム + 描画(Metal compute)
        ├─ AnimationExport     GIF / スプライトシート / PNG 連番(extension)
        ├─ Simulation.metal    カーネル群(framework の default.metallib にコンパイル)
        ├─ InputSample         入力抽象 + 擬似筆圧
        └─ StrokeStabilizer    手ブレ補正(プルストリング方式)
+
+bloom-mcp(CLI / 依存ゼロ)─ Claude Code が spawn する stdio ブリッジ(BloomMCPBridge/)
 ```
 
 ### アプリの UI 構成
@@ -34,8 +38,8 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 
 設計原則([idea.md](idea.md) のアーキテクチャ初期方針):
 
-1. **UI とコアの分離** — BloomCore はヘッドレスで動く。アプリは入力イベントをコアの API(`beginStroke` / `addStrokeSample` / `endStroke` / `clear` / `renderFrame`)に変換するだけ。将来の MCP サーバはこの同じ API を叩く
-2. **入力のデバイス非依存** — タブレット・マウス・プログラム生成(デモ/将来の MCP)すべて `InputSample(position, pressure)` に正規化される
+1. **UI とコアの分離** — BloomCore はヘッドレスで動く。アプリは入力イベントをコアの API(`beginStroke` / `addStrokeSample` / `endStroke` / `clear` / `renderFrame`)に変換するだけ。MCP サーバ(下記)もこの同じ API を叩く
+2. **入力のデバイス非依存** — タブレット・マウス・プログラム生成(デモ / MCP)すべて `InputSample(position, pressure)` に正規化される
 
 ## 滲みシミュレーション
 
@@ -152,11 +156,53 @@ BloomApp(.app / AppKit + MetalKit)─ 薄い殻
 - **手ブレ補正**(`StrokeStabilizer`): プルストリング(ラバーバンド)方式で入力点列を平滑化。出力点(anchor)が実カーソルへ向かい、両者の距離が紐長 `L = strength × 48pt` を超えた分だけ追従する(揺れ `< L` は吸収)。**幾何ベースで dt 非依存**なのでサンプルレートが揺れても挙動が安定。**位置のみ**平滑化(筆圧はいじらない)。`CanvasView` の入力経路で適用し、MCP 等が `addStrokeSample` に渡す意図的な座標は補正しない。プル方式は出力が遅れるので `endStroke` 時に `flush` で実終点まで補完して線を届かせる。強度はブラシ非依存の**グローバル設定**(インスペクタの「手ブレ」スライダ)。ユニットテストあり
 - ストロークはコア側でスタンプ間隔(`radius × 0.3`)に補間される
 
+## MCP サーバ
+
+AI エージェント(Claude Code 等)が**起動中のアプリのキャンバスをそのまま操作する**。Pencil.app 型の
+「アプリ内蔵ライブキャンバス」: エージェントが描くストローク・滲み・乾燥はユーザーがリアルタイムに見える。
+
+```
+Claude Code ──(stdio: 改行区切り JSON-RPC)── bloom-mcp(ブリッジ・依存ゼロ)
+                                                │ バイトをそのまま双方向ポンプ(フレーミングも解釈しない)
+                  ~/Library/Application Support/Bloom/mcp.sock(0600・BLOOM_MCP_SOCKET で上書き可)
+                                                │
+Bloom.app ── MCPSocketListener(accept)── MCPServerController ── MCPTools ── CanvasView / SimulationEngine
+              └ swift-sdk の StdioTransport を接続済みソケット fd に被せて流用(カスタム Transport 不要)
+```
+
+- **プロトコル処理は 100% アプリ内**(公式 [swift-sdk](https://github.com/modelcontextprotocol/swift-sdk)。0.x のため `project.yml` で exact 固定)。ブリッジ(`BloomMCPBridge/`)は stdin/stdout ⇄ ソケットの素通しポンプで、SDK にも BloomCore にも依存しない。診断は stderr のみ(stdout はプロトコル専用)
+- **接続ライフサイクル**: 接続ごとに新しい `Server` を作り `waitUntilCompleted` で切断まで面倒を見る(再接続可)。同時 2 本目は即 close(単一クライアント)。アプリ起動時に残骸ソケットがあれば接続プローブで判定し、拒否されたら unlink、生きていたら(別インスタンス)MCP を無効化してステータスバーに表示
+- **並行性**: ツール実装は全部 `@MainActor`(`MCPTools`)。SDK のハンドラから `await` で hop する。`draw_strokes` / `wait_for_dry` は `Task.sleep` を挟むので main はブロックされず、MTKView の描画(= シミュレーション進行)は止まらない
+- **UI 同期**: undo/redo・ブラシ変更は `CanvasView` のラッパー(`undo()` / `selectBrush(_:)`)経由で呼び、インスペクタ・タイムラインが既存経路で追従する。ストロークだけ engine 直(`beginStroke`/`addStrokeSample`/`endStroke`、スタビライザは通さない — 入力節参照)。MCP 描画中は `CanvasView.isExternallyDrawing` でユーザーのマウス入力をガード(ストローク状態の混線防止)
+- **ペーシング**: `draw_strokes` はサンプルを 3 点ずつ投入して 8ms 待つ。一括投入だと `maxStampsPerFrame`(1024)超過分が黙って捨てられるため。副産物として「線が生えていく」ライブ感が出る
+- **乾燥待ち**: `wait_for_dry` は `SimulationEngine.wetFraction`(W バッファの CPU 走査・shared なので安価)を 250ms 間隔でポーリング。**ウィンドウが隠れると MTKView が止まりシミュレーションも進まない**ので、タイムアウト時はその旨のヒントを返す
+- **無効化**: `--no-mcp` で起動。`--demo` 系の検証モードではそもそも起動しない
+
+### ツール(Phase 1)
+
+| ツール | 概要 |
+|---|---|
+| `get_canvas_info` | 寸法(原点左上・y 下向き・pt)・ブラシ・レイヤー・フレーム・wet_fraction・undo 可否を JSON で |
+| `set_brush` | preset(watercolor/sumi)+ color/radius/water/pigment/dryness の永続変更(インスペクタ追従) |
+| `draw_strokes` | 複数ストローク(points[]{x,y,pressure})。ストローク単位の一時ブラシ上書き可。1 ストローク = 1 undo 単位 |
+| `wait_for_dry` | 乾くまで待つ(`timeout_seconds`、既定 15 秒) |
+| `snapshot` | 現フレームを base64 PNG(image content)で返す |
+| `clear` / `undo` / `redo` | クリア(undo 可)・取り消し・やり直し |
+
+Phase 2(予定): `manage_layer` / `manage_frame` / `save_document` / `load_document`。
+Phase 3(予定): `export`(PNG/GIF/MP4/スプライト/連番)・`snapshot(frame:)`・ブリッジの自動起動(opt-in)。
+
+### 登録と検証
+
+- リポジトリの `.mcp.json`(プロジェクトスコープ)が `scripts/bloom-mcp`(ビルド済みブリッジへの sh ラッパー)を指す。このリポジトリで Claude Code を開けばサーバ「bloom」が自動認識される(要承認・要 `make build` + アプリ起動)
+- `make mcp-smoke` で Claude なしの疎通テスト(専用ソケットでアプリを起動 → initialize / tools/list / tools/call を流して応答検証 → 後始末)
+
 ## ビルド構成
 
 - **XcodeGen**: `project.yml` が真実。`Bloom.xcodeproj` は生成物(git 管理外)。`make gen` で再生成
-- **レイアウト**: Xcode 標準(ターゲット名フォルダがルート直下)
-- **Makefile**: `make run / test / demo`。DerivedData はリポジトリ外(`~/Library/Developer/Xcode/DerivedData/Bloom-cli`)— Dropbox 同期ノイズ回避
+- **レイアウト**: Xcode 標準(ターゲット名フォルダがルート直下)。ターゲットは BloomCore(framework)/ BloomApp(app)/ bloom-mcp(CLI ブリッジ)/ BloomCoreTests
+- **SwiftPM**: MCP 公式 swift-sdk を `project.yml` の `packages:` で導入(0.x のため `exactVersion` 固定)。依存するのは BloomApp のみ(BloomCore・bloom-mcp は非依存)
+- **Makefile**: `make run / test / demo / mcp-smoke`。DerivedData はリポジトリ外(`~/Library/Developer/Xcode/DerivedData/Bloom-cli`)— Dropbox 同期ノイズ回避
 - **検証**: `make demo` がデモストロークを自動実行し、wet(直後)/ dry(乾燥後)の PNG を `/tmp/bloom-snap` に出力。描き味チューニングはこのループで回す
   - ドウェル(置きっぱなし)の確認は `BloomApp --demo-dwell --snapshot-dir <dir>` → `pooled.png`(溜まり)/ `dried.png`(乾いた輪っか)
   - レイヤー合成・順序は `--demo-layers`、undo は `--demo-undo`、保存/読み込みは `--demo-saveload`
